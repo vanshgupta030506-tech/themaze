@@ -11,11 +11,12 @@ const firebaseConfig = {
 
 const PLAYER_LIMIT = 8;
 const MAZE_SIZE = 15;
-const PARTY_VISION = 2;
-const SAFE_DISTANCE = 2;
-const SEPARATION_GRACE_MS = 15000;
-const MONSTER_MOVE_MS = 4500;
+const PARTY_VISION = 3;
+const SAFE_DISTANCE = 5;
+const SEPARATION_GRACE_MS = 25000;
+const MONSTER_MOVE_MS = 6500;
 const MONSTER_DANGER_RADIUS = 3;
+const NAVIGATOR_SIGNAL_RANGE = 4;
 const PLAYER_STORAGE_KEY = "maze-of-many-player";
 const ROOM_STORAGE_KEY = "maze-of-many-room";
 const PLAYER_COLORS = ["#9bcbd0", "#d3b88d", "#b4a2d6", "#9ac49e", "#d0988a", "#98aed0", "#c7c08f", "#c08ea6"];
@@ -41,11 +42,15 @@ const state = {
   countdownStarted: false,
   separationMonitor: null,
   monsterTimer: null,
-  lastDirectionId: null,
+  patrolInitializing: false,
   lastAnnouncedNavigator: null,
   lastGameId: null,
+  lastObjectivePhase: null,
+  navigatorSignal: false,
+  monsterDangerStage: 0,
   notice: null,
-  lastMessageAt: 0
+  lastMessageAt: 0,
+  lastMoveInputAt: 0
 };
 
 function escapeHtml(value) {
@@ -232,6 +237,7 @@ function getStep(position, direction, maze) {
 }
 
 function graphDistances(maze, origin) {
+  if (!validPosition(origin, maze)) return new Map();
   const distances = new Map([[`${origin.x},${origin.y}`, 0]]);
   const queue = [origin];
   while (queue.length) {
@@ -249,40 +255,100 @@ function graphDistances(maze, origin) {
   return distances;
 }
 
-function nextMonsterPosition(room) {
-  const monster = room.monster;
-  const maze = room.maze;
-  if (!monster || !validPosition(monster.position, maze)) return { x: maze.width - 1, y: maze.height - 1 };
-  const target = room.groupPosition;
-  const distances = graphDistances(maze, monster.position);
-  const candidates = Object.keys(DIRECTIONS)
-    .map((direction) => ({ direction, position: getStep(monster.position, direction, maze) }))
-    .filter((candidate) => candidate.position);
-  if (!candidates.length) return monster.position;
-  const groupDistance = distances.get(`${target.x},${target.y}`) ?? Number.MAX_SAFE_INTEGER;
-  if (groupDistance <= 8) {
-    const fromGroup = graphDistances(maze, target);
-    candidates.sort((a, b) =>
-      (fromGroup.get(`${a.position.x},${a.position.y}`) ?? Number.MAX_SAFE_INTEGER) -
-      (fromGroup.get(`${b.position.x},${b.position.y}`) ?? Number.MAX_SAFE_INTEGER)
-    );
-    return candidates[0].position;
-  }
-  const index = (Number(monster.stepCount) || 0) % candidates.length;
-  return candidates[index].position;
+function playerDistance(room, first, second) {
+  if (!normalizeMaze(room?.maze) || !validPosition(first, room.maze) || !validPosition(second, room.maze)) return Infinity;
+  return graphDistances(room.maze, first).get(`${second.x},${second.y}`) ?? Infinity;
 }
 
-function initialMonsterPosition(maze) {
+function buildMonsterRoute(maze) {
+  const route = [{ ...maze.start }];
+  const visited = new Set([`${maze.start.x},${maze.start.y}`]);
+  const walk = (position) => {
+    const options = Object.keys(DIRECTIONS)
+      .map((direction) => getStep(position, direction, maze))
+      .filter((next) => next && !visited.has(`${next.x},${next.y}`));
+    for (let index = options.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [options[index], options[swap]] = [options[swap], options[index]];
+    }
+    for (const next of options) {
+      const key = `${next.x},${next.y}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      route.push({ ...next });
+      walk(next);
+      route.push({ ...position });
+    }
+  };
+  walk(maze.start);
+  return route;
+}
+
+function chooseNavigatorPosition(maze) {
   const fromStart = graphDistances(maze, maze.start);
-  const fromExit = graphDistances(maze, maze.exit);
   const candidates = maze.cells.flat().filter((cell) =>
     !samePosition(cell, maze.start) && !samePosition(cell, maze.exit) &&
-    (fromExit.get(`${cell.x},${cell.y}`) ?? 0) > MONSTER_DANGER_RADIUS + 1
+    (fromStart.get(`${cell.x},${cell.y}`) ?? 0) >= 8
   );
-  candidates.sort((a, b) =>
-    (fromStart.get(`${b.x},${b.y}`) ?? 0) - (fromStart.get(`${a.x},${a.y}`) ?? 0)
+  const farthest = Math.max(...candidates.map((cell) => fromStart.get(`${cell.x},${cell.y}`) || 0));
+  const remote = candidates.filter((cell) => (fromStart.get(`${cell.x},${cell.y}`) || 0) >= farthest - 3);
+  const position = remote[Math.floor(Math.random() * remote.length)] || maze.exit;
+  return { x: position.x, y: position.y };
+}
+
+function chooseMonsterRouteIndex(maze, route, navigatorPosition) {
+  const fromStart = graphDistances(maze, maze.start);
+  const fromNavigator = graphDistances(maze, navigatorPosition);
+  const candidates = route.map((position, routeIndex) => ({
+    routeIndex,
+    score: Math.min(
+      fromStart.get(`${position.x},${position.y}`) ?? 0,
+      fromNavigator.get(`${position.x},${position.y}`) ?? 0
+    )
+  })).filter(({ routeIndex, score }) =>
+    routeIndex < route.length - 1 && score > MONSTER_DANGER_RADIUS + 1
   );
-  return candidates[0] ? { x: candidates[0].x, y: candidates[0].y } : { ...maze.exit };
+  if (!candidates.length) return Math.min(1, route.length - 1);
+  const bestScore = Math.max(...candidates.map((candidate) => candidate.score));
+  const safest = candidates.filter((candidate) => candidate.score >= bestScore - 2);
+  return safest[Math.floor(Math.random() * safest.length)].routeIndex;
+}
+
+function advanceMonster(room, now = Date.now()) {
+  const monster = room.monster;
+  if (!Array.isArray(monster?.route) || monster.route.length < 2) return;
+  monster.routeIndex = ((Number(monster.routeIndex) || 0) + 1) % monster.route.length;
+  monster.position = { ...monster.route[monster.routeIndex] };
+  monster.stepCount = (Number(monster.stepCount) || 0) + 1;
+  monster.lastMovedAt = now;
+}
+
+function initializeMonsterPatrol() {
+  const room = state.room;
+  if (state.patrolInitializing || !state.roomRef || !normalizeMaze(room?.maze) || !room.monster) return;
+  const route = buildMonsterRoute(room.maze);
+  const existingIndex = route.findIndex((position) => samePosition(position, room.monster.position));
+  const routeIndex = existingIndex >= 0
+    ? existingIndex
+    : chooseMonsterRouteIndex(room.maze, route, room.players?.[room.navigatorId]?.position || room.maze.start);
+  state.patrolInitializing = true;
+  state.roomRef.transaction((current) => {
+    if (!current || current.phase !== "playing" || Array.isArray(current.monster?.route)) return;
+    current.monster = {
+      ...current.monster,
+      position: { ...route[routeIndex] },
+      route,
+      routeIndex,
+      moveInterval: MONSTER_MOVE_MS,
+      lastMovedAt: Date.now()
+    };
+    return current;
+  }).catch((error) => {
+    console.error("Could not initialize the Monster patrol.", error);
+    setNotice("The Monster's patrol could not be synchronized.", "error");
+  }).finally(() => {
+    state.patrolInitializing = false;
+  });
 }
 
 function roomRefFor(code) {
@@ -300,6 +366,7 @@ function attachRealtimeListeners() {
     }
     reconcilePresence(state.room);
     reconcileNavigator(state.room);
+    maybeFindNavigator(state.room);
     if (state.room.phase === "lobby") renderLobby(state.room);
     else if (state.room.phase === "countdown") renderCountdown(state.room);
     else if (["playing", "gameover", "escaped"].includes(state.room.phase) && normalizeMaze(state.room.maze)) renderGame(state.room);
@@ -308,11 +375,14 @@ function attachRealtimeListeners() {
     if (state.room.gameId && state.room.gameId !== state.lastGameId) {
       state.lastGameId = state.room.gameId;
       state.watchingAfterDeath = false;
+      state.lastObjectivePhase = null;
+      state.navigatorSignal = false;
+      state.monsterDangerStage = 0;
     }
     const localRecord = state.room.players?.[state.player.id];
     if (localRecord?.separatedAt && state.separationNoticeAt !== localRecord.separatedAt) {
       state.separationNoticeAt = localRecord.separatedAt;
-      setNotice("YOU ARE TOO FAR FROM THE GROUP.", "warning");
+      setNotice("YOU ARE SEPARATING FROM THE GROUP.", "warning");
     } else if (!localRecord?.separatedAt) {
       state.separationNoticeAt = null;
     }
@@ -338,14 +408,6 @@ function attachRealtimeListeners() {
     setNotice("Chat could not connect. Check database permissions.", "error");
   });
 
-  state.roomRef.child("directions").limitToLast(1).on("child_added", (snapshot) => {
-    const data = snapshot.val();
-    if (!data || snapshot.key === state.lastDirectionId ||
-        !Number.isFinite(data.timestamp) || Date.now() - data.timestamp > 12000 ||
-        !["up", "down", "left", "right", "stop", "wait"].includes(data.direction)) return;
-    state.lastDirectionId = snapshot.key;
-    setNotice(`NAVIGATOR → ALL  ·  ${data.direction === "stop" || data.direction === "wait" ? data.direction.toUpperCase() : `GO ${data.direction.toUpperCase()}`}`, "direction");
-  });
 }
 
 function reconcilePresence(room) {
@@ -368,7 +430,29 @@ function reconcileNavigator(room) {
     const stillAlive = livingPlayers(state.room?.players || {});
     if (stillAlive.some((player) => player.id === currentId)) return currentId;
     return stillAlive[0]?.id || null;
-  });
+  }).catch((error) => console.error("Could not reassign the Navigator.", error));
+}
+
+function maybeFindNavigator(room) {
+  if (!state.roomRef || room.phase !== "playing" || room.objectivePhase !== 1) return;
+  const navigator = room.players?.[room.navigatorId];
+  if (!navigator?.connected || navigator.alive === false || !validPosition(navigator.position, room.maze)) return;
+  const finder = livingPlayers(room.players).find((player) =>
+    player.id !== room.navigatorId && samePosition(player.position, navigator.position)
+  );
+  if (!finder) return;
+  state.roomRef.transaction((current) => {
+    if (!current || current.phase !== "playing" || current.objectivePhase !== 1) return;
+    const currentNavigator = current.players?.[current.navigatorId];
+    const currentFinder = livingPlayers(current.players).find((player) =>
+      player.id !== current.navigatorId && samePosition(player.position, currentNavigator?.position)
+    );
+    if (!currentFinder) return;
+    current.objectivePhase = 2;
+    current.navigatorFoundAt = Date.now();
+    current.navigatorFoundBy = currentFinder.id;
+    return current;
+  }).catch((error) => console.error("Could not confirm that the Navigator was found.", error));
 }
 
 function claimPresence() {
@@ -389,10 +473,18 @@ function handleRoomEvents(room) {
     if (state.lastAnnouncedNavigator) setNotice(`${currentNavigator?.name || "A survivor"} is now the Navigator.`, "warning");
     state.lastAnnouncedNavigator = room.navigatorId;
   }
-  const closeToMonster = room.phase === "playing" && room.monster && room.groupPosition &&
-    (graphDistances(room.maze, room.monster.position).get(`${room.groupPosition.x},${room.groupPosition.y}`) ?? Infinity) <= MONSTER_DANGER_RADIUS;
-  if (closeToMonster && !state.wasNearMonster) setNotice("Something is near.", "warning");
-  state.wasNearMonster = closeToMonster;
+  if (room.phase === "playing" && room.objectivePhase === 2 && state.lastObjectivePhase === 1) {
+    setNotice("NAVIGATOR FOUND · PHASE 02: FIND THE EXIT", "success");
+  }
+  if (room.phase === "playing" && room.objectivePhase) state.lastObjectivePhase = room.objectivePhase;
+  const me = room.players?.[state.player.id];
+  const navigator = room.players?.[room.navigatorId];
+  const signalDetected = Boolean(room.phase === "playing" && room.objectivePhase === 1 && me &&
+    me.id !== room.navigatorId && me.alive !== false && navigator?.position &&
+    playerDistance(room, me.position, navigator.position) <= NAVIGATOR_SIGNAL_RANGE);
+  if (signalDetected && !state.navigatorSignal) setNotice("SIGNAL DETECTED · THE NAVIGATOR IS CLOSE.", "success");
+  state.navigatorSignal = signalDetected;
+  updateDangerState();
 }
 
 function renderNameEntry() {
@@ -429,7 +521,7 @@ function renderLanding(errorMessage = "") {
   const room = savedRoomCode();
   appRoot.innerHTML = `
     <section class="screen lobby-screen"><div class="lobby-layout">
-      <div class="lobby-copy-block"><div class="eyebrow"><span class="pulse-dot"></span> Cooperative survival experiment</div><h1>THE MAZE<br /><span>OF MANY</span></h1><p class="intro-line">STAY TOGETHER. STAY AWAY FROM THE MONSTER. FIND THE EXIT.</p><p class="intro-copy">You are not alone.<br />You cannot see everything.<br />Stay together. Survive.</p><div class="rule-line"><span>01</span><p>The group moves as one.</p></div><div class="rule-line"><span>02</span><p>One Navigator sees the whole maze.</p></div></div>
+      <div class="lobby-copy-block"><div class="eyebrow"><span class="pulse-dot"></span> Cooperative survival experiment</div><h1>THE MAZE<br /><span>OF MANY</span></h1><p class="intro-line">FIND THE NAVIGATOR. THEN FIND THE EXIT.</p><p class="intro-copy">Explorers move alone.<br />The Navigator sees everything.<br />No one can move you but you.</p><div class="rule-line"><span>01</span><p>Explore independently, but stay within reach.</p></div><div class="rule-line"><span>02</span><p>The Navigator is stationary and can see the whole maze.</p></div></div>
       <section class="lobby-card"><span class="eyebrow">Welcome, ${escapeHtml(state.player.name)}</span><h2>CHOOSE YOUR ROOM</h2>${errorMessage ? `<p class="form-error">${escapeHtml(errorMessage)}</p>` : ""}<button id="create-room" class="primary-btn">Create a room <span>↗</span></button><div class="form-divider">OR JOIN AN EXISTING ROOM</div><form id="join-room-form"><label class="select-label" for="room-code">ROOM CODE</label><input class="lobby-input room-code-input" id="room-code" maxlength="4" autocomplete="off" placeholder="7K4P" value="${escapeHtml(room)}" required/><button class="secondary-btn" type="submit">Join room <span>↗</span></button></form><button id="change-name" class="text-btn">Change name</button></section>
     </div></section>`;
   document.getElementById("create-room").addEventListener("click", createRoom);
@@ -463,8 +555,7 @@ async function createRoom() {
           createdAt: Date.now(),
           players: {},
           presence: {},
-          messages: {},
-          directions: {}
+          messages: {}
         };
       });
       if (result.committed) {
@@ -509,7 +600,7 @@ async function joinRoom(code) {
     ) || state.player.color;
     state.player.color = color;
     persistPlayer();
-    const position = room.groupPosition || room.maze?.start || { x: 0, y: 0 };
+    const position = room.players?.[state.player.id]?.position || room.maze?.start || { x: 0, y: 0 };
     state.presenceRef = state.roomRef.child("presence").child(state.player.id).child(state.connectionId);
     await state.presenceRef.onDisconnect().remove();
     await state.presenceRef.set(true);
@@ -532,7 +623,7 @@ async function joinRoom(code) {
         connected: true,
         alive: currentPlayer?.alive !== false,
         separatedAt: null,
-        position: room.groupPosition || currentPlayer?.position || position,
+        position: currentPlayer?.position || position,
         escaped: currentPlayer?.escaped === true
       };
       return records;
@@ -561,7 +652,7 @@ function renderLobby(room) {
   const rows = players.length
     ? players.map((player) => `<li class="player-row"><span class="player-dot" style="--player-color:${safeColor(player.color)}"></span><span>${escapeHtml(player.name)}</span><span class="player-role">${escapeHtml(player.id === room.navigatorId ? "Navigator" : "Survivor")}</span><span class="online-dot" aria-label="Online"></span></li>`).join("")
     : `<li class="empty-row">Waiting for survivors…</li>`;
-  appRoot.innerHTML = `<section class="screen lobby-screen"><div class="lobby-layout"><div class="lobby-copy-block"><div class="eyebrow"><span class="pulse-dot"></span> Room ${escapeHtml(state.roomCode)}</div><h1>THE MAZE<br /><span>OF MANY</span></h1><p class="intro-line">STAY TOGETHER. STAY AWAY FROM THE MONSTER.</p><p class="intro-copy">The group moves as one.<br />Only the Navigator sees the way.</p></div><section class="lobby-card"><div class="lobby-card-header"><span class="eyebrow">Room code</span><button class="copy-code text-btn" id="copy-room-code">${escapeHtml(state.roomCode)} · COPY</button></div><div class="player-count"><strong>${players.length}</strong><span>/ ${PLAYER_LIMIT}<small>PLAYERS</small></span></div><ul class="player-list">${rows}</ul><p class="lobby-status">${full ? "Room full." : players.length < 2 ? "Waiting for at least one more player…" : host ? "The group is ready. Start the survival run." : "Waiting for the room host to begin."}</p><button id="start-game" class="primary-btn" ${canStart ? "" : "disabled"}>${full ? "Room full" : "Begin the survival run"} <span>↗</span></button><p class="lobby-footnote">${full ? "Maximum 8 players." : "Share the room code so your group can join."}</p><button id="leave-room" class="text-btn">Leave room</button></section></div><div id="notice-region" class="notice-region"></div></section>`;
+  appRoot.innerHTML = `<section class="screen lobby-screen"><div class="lobby-layout"><div class="lobby-copy-block"><div class="eyebrow"><span class="pulse-dot"></span> Room ${escapeHtml(state.roomCode)}</div><h1>THE MAZE<br /><span>OF MANY</span></h1><p class="intro-line">PHASE 01 · FIND THE NAVIGATOR · PHASE 02 · FIND THE EXIT</p><p class="intro-copy">Explorers move on their own.<br />The Navigator cannot move.<br />Stay close enough to survive.</p></div><section class="lobby-card"><div class="lobby-card-header"><span class="eyebrow">Room code</span><button class="copy-code text-btn" id="copy-room-code">${escapeHtml(state.roomCode)} · COPY</button></div><div class="player-count"><strong>${players.length}</strong><span>/ ${PLAYER_LIMIT}<small>PLAYERS</small></span></div><ul class="player-list">${rows}</ul><p class="lobby-status">${full ? "Room full." : players.length < 2 ? "Waiting for at least one more player…" : host ? "The group is ready. Start the survival run." : "Waiting for the room host to begin."}</p><button id="start-game" class="primary-btn" ${canStart ? "" : "disabled"}>${full ? "Room full" : "Begin the survival run"} <span>↗</span></button><p class="lobby-footnote">${full ? "Maximum 8 players." : "Share the room code so your group can join."}</p><button id="leave-room" class="text-btn">Leave room</button></section></div><div id="notice-region" class="notice-region"></div></section>`;
   document.getElementById("start-game")?.addEventListener("click", startCountdown);
   document.getElementById("copy-room-code")?.addEventListener("click", copyRoomCode);
   document.getElementById("leave-room")?.addEventListener("click", leaveRoom);
@@ -590,21 +681,29 @@ async function leaveRoom() {
   }
   state.roomRef?.off();
   state.roomRef?.child("messages").off();
-  state.roomRef?.child("directions").off();
+  stopMonsterMovement();
+  stopSeparationMonitor();
   state.roomRef = null;
   state.presenceRef = null;
   state.room = null;
   state.roomCode = null;
   state.joined = false;
+  state.localMode = false;
   localStorage.removeItem(ROOM_STORAGE_KEY);
   renderLanding();
 }
 
 function startCountdown() {
+  if (state.localMode) {
+    startLocalDemo();
+    return;
+  }
   if (!isLocalHost() || orderedPlayers(state.room?.players).length < 2) return;
   const maze = makeMaze();
   const now = Date.now();
-  const monsterStart = initialMonsterPosition(maze);
+  const navigatorPosition = chooseNavigatorPosition(maze);
+  const monsterRoute = buildMonsterRoute(maze);
+  const monsterRouteIndex = chooseMonsterRouteIndex(maze, monsterRoute, navigatorPosition);
   state.roomRef.transaction((room) => {
     if (!room || !["lobby", "gameover", "escaped"].includes(room.phase)) return;
     const currentPlayers = orderedPlayers(room.players || {});
@@ -612,22 +711,37 @@ function startCountdown() {
     const navigatorPlayer = currentPlayers[Math.floor(Math.random() * currentPlayers.length)];
     const living = {};
     currentPlayers.forEach((player) => {
-      living[player.id] = { ...player, alive: true, escaped: false, position: { ...maze.start }, separatedAt: null };
+      const isNavigator = player.id === navigatorPlayer.id;
+      living[player.id] = {
+        ...player,
+        alive: true,
+        escaped: false,
+        position: isNavigator ? { ...navigatorPosition } : { ...maze.start },
+        separatedAt: null,
+        monsterDangerSince: null
+      };
     });
     room.phase = "countdown";
     room.navigatorId = navigatorPlayer.id;
     room.maze = maze;
-    room.groupPosition = { ...maze.start };
-    room.monster = { position: monsterStart, stepCount: 0, lastMovedAt: now };
+    room.objectivePhase = 1;
+    room.navigatorFoundAt = null;
+    room.navigatorFoundBy = null;
+    room.monster = {
+      position: { ...monsterRoute[monsterRouteIndex] },
+      route: monsterRoute,
+      routeIndex: monsterRouteIndex,
+      stepCount: 0,
+      moveInterval: MONSTER_MOVE_MS,
+      lastMovedAt: now
+    };
     room.players = { ...(room.players || {}), ...living };
     room.startedAt = now;
     room.countdownUntil = now + 3000;
-    room.moveCount = 0;
-    room.monsterPressure = 0;
+    room.gameId = makeId();
     room.winner = null;
     room.finishedAt = null;
     room.messages = {};
-    room.directions = {};
     return room;
   }).catch((error) => {
     console.error("Could not start the room game.", error);
@@ -665,64 +779,70 @@ function renderCountdown(room) {
   }
 }
 
-function renderFormation(players, groupPosition) {
-  const survivors = livingPlayers(players);
-  const offsets = {
-    1: [[0, 0]],
-    2: [[-7, 0], [7, 0]],
-    3: [[0, -7], [-7, 7], [7, 7]],
-    4: [[-7, -7], [7, -7], [-7, 7], [7, 7]],
-    5: [[0, -9], [-9, 0], [9, 0], [-6, 9], [6, 9]],
-    6: [[-8, -7], [0, -7], [8, -7], [-8, 7], [0, 7], [8, 7]],
-    7: [[0, -10], [-8, -5], [8, -5], [-10, 5], [0, 5], [10, 5], [0, 12]],
-    8: [[-8, -8], [0, -8], [8, -8], [-8, 0], [8, 0], [-8, 8], [0, 8], [8, 8]]
-  }[Math.min(survivors.length, 8)] || [];
-  return survivors.map((player, index) => {
-    const [dx, dy] = offsets[index] || [0, 0];
-    return `<span class="party-member ${player.id === state.player.id ? "party-self" : ""}" style="--player-color:${safeColor(player.color)};--party-x:${dx}px;--party-y:${dy}px" title="${escapeHtml(player.name)}">${escapeHtml(player.name.slice(0, 2).toUpperCase())}</span>`;
-  }).join("");
-}
-
-function markerForCell(room, x, y, isNavigator) {
-  const group = room.groupPosition;
-  const players = livingPlayers(room.players || {});
+function markerForCell(room, x, y, isNavigator, revealNavigator) {
   let marker = "";
-  if (group?.x === x && group?.y === y) marker = `<span class="party-formation">${renderFormation(room.players, group)}</span>`;
-  if (isNavigator && room.monster?.position?.x === x && room.monster?.position?.y === y) {
+  const playersAtCell = livingPlayers(room.players || {}).filter((player) => samePosition(player.position, { x, y }));
+  const offsets = [[0, 0], [-7, -6], [7, -6], [-7, 6], [7, 6], [0, -8], [-8, 0], [8, 0]];
+  for (const [index, player] of playersAtCell.entries()) {
+    if (player.id === room.navigatorId && !revealNavigator) continue;
+    const [offsetX, offsetY] = offsets[index] || [0, 0];
+    const offsetStyle = `--marker-x:${offsetX}px;--marker-y:${offsetY}px;`;
+    marker += `<span class="player-marker ${player.id === state.player.id ? "is-me" : ""} ${player.id === room.navigatorId ? "is-navigator" : ""}" style="--player-color:${safeColor(player.color)};${offsetStyle}" title="${escapeHtml(player.name)}">${player.id === room.navigatorId ? "<span>N</span>" : escapeHtml(player.name.slice(0, 1).toUpperCase())}</span>`;
+  }
+  if (room.monster?.position && samePosition(room.monster.position, { x, y })) {
     marker += `<span class="monster-marker" title="The Monster"><i></i><i></i></span>`;
   }
-  if (isNavigator && room.maze.exit.x === x && room.maze.exit.y === y) marker += `<span class="exit-marker">◇</span>`;
-  return `${marker}<span class="cell-player-names">${players.filter((player) => group?.x === x && group?.y === y).map((player) => escapeHtml(player.name)).join(" · ")}</span>`;
+  if ((isNavigator || room.objectivePhase === 2) && samePosition(room.maze.exit, { x, y })) marker += `<span class="exit-marker">◇</span>`;
+  return marker;
+}
+
+function canSeeNavigator(room, isNavigator) {
+  if (isNavigator || room.objectivePhase === 2) return true;
+  const navigator = room.players?.[room.navigatorId];
+  const me = room.players?.[state.player.id];
+  return Boolean(navigator?.position && me?.position &&
+    playerDistance(room, navigator.position, me.position) <= 2);
 }
 
 function isCellVisible(room, x, y, isNavigator) {
   if (isNavigator) return true;
-  const position = room.groupPosition;
+  const position = room.players?.[state.player.id]?.position || room.maze.start;
   return Math.abs(position.x - x) <= PARTY_VISION && Math.abs(position.y - y) <= PARTY_VISION;
 }
 
 function renderMaze(room, isNavigator) {
   const maze = room.maze;
-  const group = validPosition(room.groupPosition, maze) ? room.groupPosition : maze.start;
+  const me = room.players?.[state.player.id];
+  const position = validPosition(me?.position, maze) ? me.position : maze.start;
   const bounds = isNavigator
     ? { minX: 0, maxX: maze.width - 1, minY: 0, maxY: maze.height - 1 }
     : {
-        minX: Math.max(0, group.x - PARTY_VISION - 1), maxX: Math.min(maze.width - 1, group.x + PARTY_VISION + 1),
-        minY: Math.max(0, group.y - PARTY_VISION - 1), maxY: Math.min(maze.height - 1, group.y + PARTY_VISION + 1)
+        minX: Math.max(0, position.x - PARTY_VISION - 1), maxX: Math.min(maze.width - 1, position.x + PARTY_VISION + 1),
+        minY: Math.max(0, position.y - PARTY_VISION - 1), maxY: Math.min(maze.height - 1, position.y + PARTY_VISION + 1)
       };
   const cells = [];
   const dangerDistances = isNavigator && room.monster?.position
     ? graphDistances(maze, room.monster.position)
     : new Map();
+  const patrolCells = new Set(isNavigator
+    ? (room.monster?.route || []).map((cell) => `${cell.x},${cell.y}`)
+    : []);
+  const monsterPosition = room.monster?.position;
   for (let y = bounds.minY; y <= bounds.maxY; y += 1) {
     for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
       const cell = maze.cells[y][x];
       const visible = isCellVisible(room, x, y, isNavigator);
       const danger = isNavigator && (dangerDistances.get(`${x},${y}`) ?? Infinity) <= MONSTER_DANGER_RADIUS;
+      const atMonster = samePosition(monsterPosition, { x, y });
+      const exitVisible = visible && (isNavigator || room.objectivePhase === 2) && samePosition(maze.exit, { x, y });
+      const revealNavigator = canSeeNavigator(room, isNavigator);
+      const hasPlayer = livingPlayers(room.players).some((player) =>
+        (player.id !== room.navigatorId || revealNavigator) && samePosition(player.position, { x, y })
+      );
       const wallStyles = [
         ["north", "border-top"], ["east", "border-right"], ["south", "border-bottom"], ["west", "border-left"]
       ].map(([wall, property]) => `${property}:${cell.walls[wall] ? "2px solid var(--wall)" : "2px solid transparent"}`).join(";");
-      cells.push(`<div class="maze-cell ${visible ? "revealed" : "fogged"} ${danger ? "danger-cell" : ""} ${room.groupPosition?.x === x && room.groupPosition?.y === y ? "party-cell" : ""} ${isNavigator && room.monster?.position?.x === x && room.monster?.position?.y === y ? "monster-cell" : ""}" style="${wallStyles}" aria-label="${visible ? `Cell ${x + 1}, ${y + 1}${danger ? ", monster danger zone" : ""}` : "Unexplored"}">${visible ? markerForCell(room, x, y, isNavigator) : ""}</div>`);
+      cells.push(`<div class="maze-cell ${visible ? "revealed" : "fogged"} ${danger ? "danger-cell" : ""} ${isNavigator && patrolCells.has(`${x},${y}`) ? "patrol-cell" : ""} ${visible && hasPlayer ? "player-cell" : ""} ${atMonster && isNavigator ? "monster-cell" : ""} ${exitVisible ? "exit-cell" : ""}" style="${wallStyles}" aria-label="${visible ? `Cell ${x + 1}, ${y + 1}${danger ? ", monster danger zone" : ""}` : "Unexplored"}">${visible ? markerForCell(room, x, y, isNavigator, revealNavigator) : ""}</div>`);
     }
   }
   return `<div class="maze-viewport" tabindex="0"><div class="maze-grid ${isNavigator ? "full-map" : "local-map"}" style="--columns:${bounds.maxX - bounds.minX + 1};--cell:27px">${cells.join("")}</div></div>`;
@@ -731,13 +851,16 @@ function renderMaze(room, isNavigator) {
 function renderPlayerPanel(room, isNavigator) {
   const players = orderedPlayers(room.players);
   const alive = players.filter((player) => player.alive !== false);
-  const canControl = isNavigator && room.players?.[state.player.id]?.alive !== false;
-  return `<section class="side-section"><div class="section-heading"><span>SURVIVORS</span><span>${alive.length} / ${players.length}</span></div><div class="live-player-list">${players.map((player) => `<div class="live-player ${player.alive === false ? "player-dead" : ""}"><span class="player-dot" style="--player-color:${safeColor(player.color)}"></span><span class="live-player-name">${escapeHtml(player.name)}${player.id === room.navigatorId ? " <i>NAVIGATOR</i>" : ""}</span><span class="player-state">${player.connected ? player.alive === false ? "LOST" : player.separatedAt ? "TOO FAR" : player.escaped ? "OUT" : "ALIVE" : "OFFLINE"}</span></div>`).join("")}</div><div class="escape-progress"><span>GROUP LOCATION</span><strong>${String((room.groupPosition?.x ?? 0) + 1).padStart(2, "0")} : ${String((room.groupPosition?.y ?? 0) + 1).padStart(2, "0")}</strong></div>${canControl ? `<div class="movement-controls"><span class="select-label">MOVE THE GROUP</span><div class="direction-grid"><button data-move="up" aria-label="Move up">↑</button><button data-move="left" aria-label="Move left">←</button><button data-move="down" aria-label="Move down">↓</button><button data-move="right" aria-label="Move right">→</button></div><div class="wait-controls"><button data-direction="wait">WAIT</button><button data-direction="stop">STOP</button></div></div>` : ""}</section>`;
+  const me = room.players?.[state.player.id];
+  const position = me?.position || room.maze.start;
+  const separationAge = me?.separatedAt ? Date.now() - me.separatedAt : 0;
+  const separationText = separationAge > 16000 ? "RETURN TO THE GROUP." : "YOU ARE SEPARATING FROM THE GROUP.";
+  return `<section class="side-section"><div class="section-heading"><span>SURVIVORS</span><span>${alive.length} / ${players.length}</span></div><div class="live-player-list">${players.map((player) => `<div class="live-player ${player.alive === false ? "player-dead" : ""}"><span class="player-dot" style="--player-color:${safeColor(player.color)}"></span><span class="live-player-name">${escapeHtml(player.name)}${player.id === room.navigatorId ? " <i>NAVIGATOR</i>" : ""}</span><span class="player-state">${player.connected ? player.alive === false ? "LOST" : player.separatedAt ? "TOO FAR" : player.escaped ? "AT EXIT" : "ALIVE" : "OFFLINE"}</span></div>`).join("")}</div><div class="escape-progress"><span>YOUR LOCATION</span><strong>${String(position.x + 1).padStart(2, "0")} : ${String(position.y + 1).padStart(2, "0")}</strong></div>${me?.separatedAt ? `<p class="separation-status">${separationText}</p>` : `<p class="separation-status stable-status">${me?.escaped ? "YOU MADE IT · WAIT FOR THE EXPLORERS" : `CONNECTION STABLE · KEEP WITHIN ${SAFE_DISTANCE} CORRIDORS`}</p>`}${!isNavigator && me?.alive !== false && me?.escaped !== true ? `<div class="movement-controls"><span class="select-label">MOVE YOUR EXPLORER · WASD / ARROWS</span><div class="direction-grid"><button data-move="up" aria-label="Move up">↑</button><button data-move="left" aria-label="Move left">←</button><button data-move="down" aria-label="Move down">↓</button><button data-move="right" aria-label="Move right">→</button></div></div>` : ""}</section>`;
 }
 
 function renderChat(room) {
   const messages = Object.entries(room.messages || {}).sort((a, b) => (a[1].timestamp || 0) - (b[1].timestamp || 0)).slice(-25);
-  return `<section class="chat-section"><div class="section-heading"><span>FIELD NOTES</span><span class="live-label">LIVE</span></div><div class="chat-messages" id="chat-messages">${messages.map(([id, message]) => renderMessage(id, message)).join("")}<div id="chat-end"></div></div><form id="chat-form" class="chat-form"><input id="chat-input" maxlength="180" autocomplete="off" placeholder="Send a message…" aria-label="Chat message" /><button type="submit" aria-label="Send message">↗</button></form></section>`;
+  return `<section class="chat-section"><div class="section-heading"><span>${room.objectivePhase === 2 ? "NAVIGATOR CHANNEL" : "FIELD NOTES"}</span><span class="live-label">LIVE</span></div><div class="chat-messages" id="chat-messages">${messages.map(([id, message]) => renderMessage(id, message)).join("")}<div id="chat-end"></div></div><form id="chat-form" class="chat-form"><input id="chat-input" maxlength="180" autocomplete="off" placeholder="Send a message…" aria-label="Chat message" /><button type="submit" aria-label="Send message">↗</button></form></section>`;
 }
 
 function renderMessage(id, message) {
@@ -752,16 +875,22 @@ function renderGame(room) {
   }
   const isNavigator = room.navigatorId === state.player.id;
   const alive = me.alive !== false;
-  const survivorCount = livingPlayers(room.players).length;
-  const explorers = orderedPlayers(room.players);
-  const near = room.phase === "playing" && monsterDistance(room) <= MONSTER_DANGER_RADIUS;
+  const explorers = orderedPlayers(room.players).filter((player) => player.id !== room.navigatorId);
+  const escapedCount = explorers.filter((player) => player.alive !== false && player.escaped).length;
+  const objectivePhase = room.objectivePhase === 2 ? 2 : 1;
+  const near = room.phase === "playing" && monsterDistance(room, state.player.id) <= MONSTER_DANGER_RADIUS;
   document.body.classList.toggle("danger-near", near);
+  const objectiveLabel = objectivePhase === 1 ? "FIND THE NAVIGATOR" : "FIND THE EXIT";
+  const myPosition = me.position || room.maze.start;
+  const transitionVisible = room.navigatorFoundAt && Date.now() - room.navigatorFoundAt < 4500;
   appRoot.innerHTML = `<section class="game-screen ${near ? "danger-near" : ""}">
     <header class="game-topbar"><div><span class="eyebrow"><span class="pulse-dot"></span> ${state.connected ? "SYNCHRONIZED" : "RECONNECTING"} · ROOM ${escapeHtml(state.roomCode)}</span><h1>THE MAZE <span>OF MANY</span></h1></div><div class="game-top-meta"><span>RUN <strong>${escapeHtml(String(room.gameId || "").slice(-5).toUpperCase())}</strong></span><button id="leave-room" class="text-btn">LEAVE</button></div></header>
-    <div class="game-layout ${isNavigator ? "navigator-layout" : "explorer-layout"}"><main class="map-column"><div class="map-heading"><div><span class="eyebrow">${isNavigator ? "Navigator / tactical view" : "Explorer / field view"}</span><p>${isNavigator ? "You are part of the party. Guide everyone through the maze." : "Stay with the group. The Navigator sees beyond the fog."}</p></div><span class="map-coordinates">${String((room.groupPosition?.x ?? 0) + 1).padStart(2, "0")} / ${String((room.groupPosition?.y ?? 0) + 1).padStart(2, "0")}</span></div>${renderMaze(room, isNavigator)}<div class="map-legend"><span><i class="legend-you" style="--player-color:${safeColor(state.player.color)}"></i> PARTY (${livingPlayers(room.players).length})</span>${isNavigator ? `<span><i class="legend-monster"></i> MONSTER / ${MONSTER_DANGER_RADIUS} CELL THREAT</span><span><i class="legend-exit"></i> EXIT</span>` : `<span class="fog-legend">UNEXPLORED</span><span class="party-hint">THE WHOLE GROUP MOVES TOGETHER</span>`}</div>${isNavigator && alive ? `<div class="mobile-controls"><div class="direction-pad"><button data-move="up">↑</button><button data-move="left">←</button><button data-move="down">↓</button><button data-move="right">→</button></div><span class="control-hint">MOVE THE GROUP</span></div>` : ""}</main><aside class="control-column"><div class="role-card"><span class="eyebrow">Your role</span><strong>${isNavigator ? "THE NAVIGATOR" : "AN EXPLORER"}</strong><span>${escapeHtml(isNavigator ? "You are their eyes. The group moves when you move." : `Together with ${survivorCount} survivor${survivorCount === 1 ? "" : "s"}.`)}</span></div>${renderPlayerPanel(room, isNavigator)}${renderChat(room)}</aside></div>
+    <section class="objective-banner phase-${objectivePhase}"><span>PHASE 0${objectivePhase}</span><strong>${objectiveLabel}</strong><p>${isNavigator ? "You see the whole maze. Stay where you are and guide the Explorers in chat." : objectivePhase === 1 ? "Explore on your own. Find the person who can see the whole maze." : "The Navigator has been found. Reach the exit together, one Explorer at a time."}</p></section>
+    <div class="game-layout ${isNavigator ? "navigator-layout" : "explorer-layout"}"><main class="map-column"><div class="map-heading"><div><span class="eyebrow">${isNavigator ? "NAVIGATOR · FULL TACTICAL VIEW" : "EXPLORER · FIELD VIEW"}</span><p>${isNavigator ? "You are stationary. Track every Explorer, the patrol, and the exit." : objectivePhase === 1 ? "Find the hidden Navigator. The maze beyond your sight is unknown." : "Follow the Navigator's guidance through the maze."}</p></div><span class="map-coordinates">${String(myPosition.x + 1).padStart(2, "0")} / ${String(myPosition.y + 1).padStart(2, "0")}</span></div>${renderMaze(room, isNavigator)}<div class="map-legend"><span><i class="legend-you" style="--player-color:${safeColor(state.player.color)}"></i> ${isNavigator ? "NAVIGATOR" : "YOU"}</span>${isNavigator ? `<span><i class="legend-monster"></i> MONSTER · PATROL ${room.monster?.route?.length || 0} CELLS</span><span><i class="legend-exit"></i> EXIT</span><span class="patrol-legend">PATROL ROUTE</span>` : `<span class="fog-legend">UNEXPLORED</span><span class="party-hint">${objectivePhase === 1 ? "NAVIGATOR HIDDEN" : "EXIT REVEALED AS YOU EXPLORE"}</span>`}</div></main><aside class="control-column"><div class="role-card"><span class="eyebrow">Your role</span><strong>${isNavigator ? "THE NAVIGATOR · STATIONARY" : "AN EXPLORER · YOU CONTROL YOURSELF"}</strong><span>${escapeHtml(isNavigator ? "They can see what you cannot. Guide them through chat; you cannot move." : objectivePhase === 1 ? "Move independently with WASD, arrows, or the directional pad." : "You must reach the exit yourself. The Navigator cannot move you.")}</span></div>${renderPlayerPanel(room, isNavigator)}${renderChat(room)}</aside></div>
+    ${transitionVisible ? `<div class="phase-transition"><span>NAVIGATOR FOUND</span><strong>PHASE 02 · FIND THE EXIT</strong></div>` : ""}
     ${!alive && room.phase === "playing" && !state.watchingAfterDeath ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">Signal lost</span><h2>YOU WERE<br /><span>LOST.</span></h2><p>You can still watch the survivors find their way.</p><button id="watch-game" class="primary-btn">Watch the group <span>↗</span></button></div></div>` : ""}
-    ${room.phase === "gameover" ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">No survivors remain</span><h2>THE MAZE<br /><span>HAS CLAIMED YOU.</span></h2><p>The group did not make it out.</p><button id="retry-game" class="primary-btn">${isLocalHost() ? "Try again" : "Waiting for the host"} <span>↗</span></button></div></div>` : ""}
-    ${room.phase === "escaped" ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">Run ${formatDuration((room.finishedAt || Date.now()) - room.startedAt)}</span><h2>YOU<br /><span>ESCAPED.</span></h2><p>SURVIVORS: ${survivorCount} / ${explorers.length}</p><button id="retry-game" class="primary-btn" ${isLocalHost() ? "" : "disabled"}>${isLocalHost() ? "Enter another maze" : "Waiting for the host"} <span>↗</span></button></div></div>` : ""}
+    ${room.phase === "gameover" ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">No Explorers remain</span><h2>THE MAZE<br /><span>WON.</span></h2><p>Nobody found the way out.</p><button id="retry-game" class="primary-btn">${isLocalHost() ? "Try again" : "Waiting for the host"} <span>↗</span></button></div></div>` : ""}
+    ${room.phase === "escaped" ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">Run ${formatDuration((room.finishedAt || Date.now()) - room.startedAt)}</span><h2>ESCAPE<br /><span>COMPLETE.</span></h2><p>SURVIVORS: ${escapedCount} / ${explorers.filter((player) => player.alive !== false).length}<br />TIME: ${formatDuration((room.finishedAt || Date.now()) - room.startedAt)}</p><button id="retry-game" class="primary-btn" ${isLocalHost() ? "" : "disabled"}>${isLocalHost() ? "Enter a new maze" : "Waiting for the host"} <span>↗</span></button></div></div>` : ""}
     <div id="notice-region" class="notice-region"></div>
   </section>`;
   document.getElementById("leave-room")?.addEventListener("click", leaveRoom);
@@ -771,8 +900,7 @@ function renderGame(room) {
     state.watchingAfterDeath = true;
     document.querySelector(".completion-overlay")?.remove();
   });
-  document.querySelectorAll("[data-move]").forEach((button) => button.addEventListener("click", () => moveGroup(button.dataset.move)));
-  document.querySelectorAll("[data-direction]").forEach((button) => button.addEventListener("click", () => sendDirection(button.dataset.direction)));
+  document.querySelectorAll("[data-move]").forEach((button) => button.addEventListener("click", () => movePlayer(button.dataset.move)));
   restoreNotice();
 }
 
@@ -781,133 +909,174 @@ function formatDuration(milliseconds) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function monsterDistance(room) {
-  if (!room?.monster?.position || !room?.groupPosition || !normalizeMaze(room.maze)) return Infinity;
-  return graphDistances(room.maze, room.monster.position).get(`${room.groupPosition.x},${room.groupPosition.y}`) ?? Infinity;
-}
-
-function updateDangerState() {
-  if (!state.room || state.room.phase !== "playing") return;
-  const close = monsterDistance(state.room) <= MONSTER_DANGER_RADIUS;
-  document.body.classList.toggle("danger-near", close);
-  if (close && !state.wasNearMonster) setNotice("SOMETHING IS NEAR.", "warning");
-  state.wasNearMonster = close;
-}
-
-function moveGroup(direction) {
-  if (!DIRECTIONS[direction] || !state.roomRef || state.localMode) {
-    if (DIRECTIONS[direction] && state.localMode) moveLocalGroup(direction);
-    return;
-  }
-  if (state.room?.phase !== "playing" || state.room.navigatorId !== state.player.id ||
-      state.room.players?.[state.player.id]?.alive === false) return;
-  state.roomRef.transaction((room) => {
-    if (!room || room.phase !== "playing" || room.navigatorId !== state.player.id) return;
-    const nextPosition = getStep(room.groupPosition, direction, room.maze);
-    if (!nextPosition) return;
-    room.groupPosition = nextPosition;
-    room.moveCount = (Number(room.moveCount) || 0) + 1;
-    for (const player of Object.values(room.players || {})) {
-      if (player?.connected && player.alive !== false) player.position = nextPosition;
-    }
-    if (room.moveCount % 2 === 0) {
-      room.monster = {
-        ...room.monster,
-        position: nextMonsterPosition(room),
-        stepCount: (Number(room.monster?.stepCount) || 0) + 1,
-        lastMovedAt: Date.now()
-      };
-    }
-    const distance = graphDistances(room.maze, room.monster.position).get(`${nextPosition.x},${nextPosition.y}`) ?? Infinity;
-    room.monsterPressure = distance <= 1 ? (Number(room.monsterPressure) || 0) + 1 : 0;
-    if (room.monsterPressure >= 3) {
-      const survivors = livingPlayers(room.players);
-      const victim = survivors[Math.floor(Math.random() * survivors.length)];
-      if (victim) {
-        victim.alive = false;
-        victim.lostAt = Date.now();
-      }
-      room.monsterPressure = 0;
-      const remaining = livingPlayers(room.players);
-      if (!remaining.length) {
-        room.phase = "gameover";
-        room.finishedAt = Date.now();
-      } else if (!remaining.some((player) => player.id === room.navigatorId)) {
-        room.navigatorId = remaining[0].id;
-      }
-    }
-    if (samePosition(nextPosition, room.maze.exit)) {
-      room.phase = "escaped";
-      room.finishedAt = Date.now();
-    }
-    return room;
-  }).then((result) => {
-    if (!result.committed && state.room?.phase === "playing") setNotice("PATH BLOCKED", "warning");
-  }).catch((error) => {
-    console.error("Could not move the party.", error);
-    setNotice("Movement did not sync. Check the connection.", "error");
-  });
-}
-
 function samePosition(a, b) {
   return a?.x === b?.x && a?.y === b?.y;
 }
 
-function moveLocalGroup(direction) {
+function monsterDistance(room, playerId = state.player?.id) {
+  const position = room?.players?.[playerId]?.position;
+  if (!room?.monster?.position || !validPosition(position, room.maze)) return Infinity;
+  return playerDistance(room, room.monster.position, position);
+}
+
+function updateDangerState() {
+  if (!state.room || state.room.phase !== "playing") {
+    document.body.classList.remove("danger-near", "danger-critical");
+    state.monsterDangerStage = 0;
+    return;
+  }
+  const distance = monsterDistance(state.room);
+  const stage = distance <= 1 ? 3 : distance <= 2 ? 2 : distance <= MONSTER_DANGER_RADIUS ? 1 : 0;
+  document.body.classList.toggle("danger-near", stage > 0);
+  document.body.classList.toggle("danger-critical", stage === 3);
+  if (stage > state.monsterDangerStage) {
+    const warning = ["", "SOMETHING IS NEAR.", "IT IS GETTING CLOSER.", "RUN."];
+    setNotice(warning[stage], "warning");
+    if (stage === 3 && navigator.vibrate) navigator.vibrate([90, 70, 90]);
+  }
+  state.monsterDangerStage = stage;
+}
+
+function resolveGameOutcome(room, now = Date.now()) {
+  const previousPhase = room.phase;
+  const explorers = livingPlayers(room.players).filter((player) => player.id !== room.navigatorId);
+  if (!explorers.length) {
+    room.phase = "gameover";
+    room.finishedAt = now;
+    return room.phase !== previousPhase;
+  }
+  if (room.objectivePhase === 2 && explorers.every((player) => player.escaped === true)) {
+    room.phase = "escaped";
+    room.finishedAt = now;
+    room.winner = explorers.map((player) => player.id);
+  }
+  return room.phase !== previousPhase;
+}
+
+function movePlayer(direction) {
+  if (!DIRECTIONS[direction] || state.room?.phase !== "playing") return;
+  if (state.room.navigatorId === state.player?.id ||
+      state.room.players?.[state.player.id]?.alive === false ||
+      state.room.players?.[state.player.id]?.escaped === true) return;
+  const now = Date.now();
+  if (now - state.lastMoveInputAt < 150) return;
+  state.lastMoveInputAt = now;
+  if (state.localMode) {
+    moveLocalPlayer(direction);
+    return true;
+  }
+  if (!state.roomRef) return;
+  return state.roomRef.transaction((room) => {
+    const player = room?.players?.[state.player.id];
+    if (!room || room.phase !== "playing" || room.navigatorId === state.player.id ||
+        !player || player.alive === false || player.escaped === true ||
+        !validPosition(player.position, room.maze)) return;
+    const nextPosition = getStep(player.position, direction, room.maze);
+    if (!nextPosition) return;
+    const now = Date.now();
+    player.position = nextPosition;
+    player.lastMoveAt = now;
+    player.separatedAt = null;
+    if (room.objectivePhase === 1 &&
+        samePosition(nextPosition, room.players?.[room.navigatorId]?.position)) {
+      room.objectivePhase = 2;
+      room.navigatorFoundAt = now;
+      room.navigatorFoundBy = player.id;
+    }
+    if (room.objectivePhase === 2 && samePosition(nextPosition, room.maze.exit)) player.escaped = true;
+    resolveGameOutcome(room, now);
+    return room;
+  }).then((result) => {
+    if (!result.committed && state.room?.phase === "playing") setNotice("PATH BLOCKED", "warning");
+  }).catch((error) => {
+    console.error("Could not move the Explorer.", error);
+    setNotice("Movement did not sync. Check the connection.", "error");
+  });
+}
+
+function moveLocalPlayer(direction) {
   const room = state.room;
-  if (!room || room.phase !== "playing") return;
-  const next = getStep(room.groupPosition, direction, room.maze);
-  if (!next) {
+  const player = room?.players?.[state.player.id];
+  if (!room || room.phase !== "playing" || !player || player.id === room.navigatorId ||
+      player.escaped === true) return;
+  const nextPosition = getStep(player.position, direction, room.maze);
+  if (!nextPosition) {
     setNotice("PATH BLOCKED", "warning");
     return;
   }
-  room.groupPosition = next;
-  room.moveCount += 1;
-  for (const player of Object.values(room.players)) {
-    if (player.alive !== false) player.position = next;
+  const now = Date.now();
+  player.position = nextPosition;
+  player.separatedAt = null;
+  if (room.objectivePhase === 1 &&
+      samePosition(nextPosition, room.players?.[room.navigatorId]?.position)) {
+    room.objectivePhase = 2;
+    room.navigatorFoundAt = now;
+    room.navigatorFoundBy = player.id;
   }
-  if (room.moveCount % 2 === 0) {
-    room.monster.position = nextMonsterPosition(room);
-    room.monster.stepCount += 1;
-  }
-  const distance = monsterDistance(room);
-  room.monsterPressure = distance <= 1 ? room.monsterPressure + 1 : 0;
-  if (room.monsterPressure >= 3) {
-    const victim = livingPlayers(room.players).find((player) => player.id !== room.navigatorId) || livingPlayers(room.players)[0];
-    if (victim) victim.alive = false;
-    room.monsterPressure = 0;
-  }
-  if (!livingPlayers(room.players).length) room.phase = "gameover";
-  else if (!livingPlayers(room.players).some((player) => player.id === room.navigatorId)) {
-    room.navigatorId = livingPlayers(room.players)[0].id;
-    setNotice(`${room.players[room.navigatorId].name} is now the Navigator.`, "warning");
-  }
-  else if (samePosition(next, room.maze.exit)) room.phase = "escaped";
-  if (room.phase !== "playing") room.finishedAt = Date.now();
+  if (room.objectivePhase === 2 && samePosition(nextPosition, room.maze.exit)) player.escaped = true;
+  resolveGameOutcome(room, now);
   renderGame(room);
   updateDangerState();
 }
 
+function applyMonsterThreat(room, now) {
+  for (const player of livingPlayers(room.players).filter((record) => record.escaped !== true)) {
+    const distance = playerDistance(room, room.monster.position, player.position);
+    if (distance > 1) {
+      player.monsterDangerSince = null;
+      continue;
+    }
+    if (!player.monsterDangerSince) player.monsterDangerSince = now;
+    else if (now - player.monsterDangerSince >= 12000) {
+      player.alive = false;
+      player.lostAt = now;
+      player.monsterDangerSince = null;
+    }
+  }
+  if (!livingPlayers(room.players).some((player) => player.id === room.navigatorId)) {
+    const replacement = orderedPlayers(room.players).find((player) => player.connected && player.alive !== false);
+    if (replacement) room.navigatorId = replacement.id;
+  }
+  resolveGameOutcome(room, now);
+}
+
 function startMonsterMovement() {
-  if (state.monsterTimer || state.localMode) return;
+  if (state.monsterTimer) return;
   state.monsterTimer = setInterval(() => {
+    if (state.localMode) {
+      const room = state.room;
+      if (!room || room.phase !== "playing") {
+        stopMonsterMovement();
+        stopSeparationMonitor();
+        return;
+      }
+      if (Date.now() - (Number(room.monster?.lastMovedAt) || 0) < MONSTER_MOVE_MS) return;
+      const now = Date.now();
+      advanceMonster(room, now);
+      applyMonsterThreat(room, now);
+      renderGame(room);
+      updateDangerState();
+      return;
+    }
     if (!state.roomRef || state.room?.phase !== "playing" || state.room.navigatorId !== state.player.id ||
         state.room.players?.[state.player.id]?.alive === false) {
       stopMonsterMovement();
       return;
     }
+    if (!Array.isArray(state.room.monster?.route) || state.room.monster.route.length < 2) {
+      initializeMonsterPatrol();
+      return;
+    }
     state.roomRef.transaction((room) => {
+      const navigator = room?.players?.[state.player.id];
       if (!room || room.phase !== "playing" || room.navigatorId !== state.player.id ||
-          room.players?.[state.player.id]?.alive === false ||
-          Date.now() - (Number(room.monster?.lastMovedAt) || 0) < MONSTER_MOVE_MS) return;
-      room.monster = {
-        ...room.monster,
-        position: nextMonsterPosition(room),
-        stepCount: (Number(room.monster?.stepCount) || 0) + 1,
-        lastMovedAt: Date.now()
-      };
+          navigator?.alive === false ||
+          Date.now() - (Number(room.monster?.lastMovedAt) || 0) < (Number(room.monster?.moveInterval) || MONSTER_MOVE_MS)) return;
+      const now = Date.now();
+      advanceMonster(room, now);
+      applyMonsterThreat(room, now);
       return room;
-    }).catch((error) => console.error("Monster movement could not synchronize.", error));
+    }).catch((error) => console.error("Monster patrol could not synchronize.", error));
   }, 1000);
 }
 
@@ -916,36 +1085,69 @@ function stopMonsterMovement() {
   state.monsterTimer = null;
 }
 
-function checkSeparation() {
-  const room = state.room;
-  if (!room || room.phase !== "playing" || !room.groupPosition) return;
-  const now = Date.now();
-  const updates = {};
-  let markedDeath = false;
-  for (const [id, player] of Object.entries(room.players || {})) {
-    if (!player?.connected || player.alive === false) continue;
-    const position = player.position;
-    const distance = position ? Math.abs(position.x - room.groupPosition.x) + Math.abs(position.y - room.groupPosition.y) : 0;
+function updateSeparationState(room, now) {
+  const explorers = livingPlayers(room.players)
+    .filter((player) => player.id !== room.navigatorId && player.escaped !== true && validPosition(player.position, room.maze));
+  let changed = false;
+  if (explorers.length < 2) {
+    for (const player of explorers) {
+      if (player.separatedAt) {
+        player.separatedAt = null;
+        changed = true;
+      }
+    }
+    return resolveGameOutcome(room, now) || changed;
+  }
+  const distanceMaps = explorers.map((player) => graphDistances(room.maze, player.position));
+  let centerIndex = 0;
+  let lowestTotal = Infinity;
+  for (let index = 0; index < explorers.length; index += 1) {
+    const total = explorers.reduce((sum, other) =>
+      sum + (distanceMaps[index].get(`${other.position.x},${other.position.y}`) ?? Infinity), 0);
+    if (total < lowestTotal) {
+      lowestTotal = total;
+      centerIndex = index;
+    }
+  }
+  const center = explorers[centerIndex].position;
+  const fromCenter = graphDistances(room.maze, center);
+  for (const player of explorers) {
+    const distance = fromCenter.get(`${player.position.x},${player.position.y}`) ?? Infinity;
     if (distance <= SAFE_DISTANCE) {
-      if (player.separatedAt) updates[`players/${id}/separatedAt`] = null;
+      if (player.separatedAt) {
+        player.separatedAt = null;
+        changed = true;
+      }
       continue;
     }
-    if (!player.separatedAt) updates[`players/${id}/separatedAt`] = now;
-    else if (now - player.separatedAt > SEPARATION_GRACE_MS) {
-      updates[`players/${id}/alive`] = false;
-      updates[`players/${id}/lostAt`] = now;
-      markedDeath = true;
+    if (!player.separatedAt) {
+      player.separatedAt = now;
+      changed = true;
+    }
+    else if (now - player.separatedAt >= SEPARATION_GRACE_MS) {
+      player.alive = false;
+      player.lostAt = now;
+      player.separatedAt = null;
+      changed = true;
     }
   }
-  if (Object.keys(updates).length && state.roomRef) {
-    state.roomRef.update(updates).then(() => {
-      if (markedDeath) {
-        setNotice("A survivor lost connection to the group.", "warning");
-        const alive = livingPlayers(state.room?.players || {});
-        if (!alive.length) state.roomRef?.child("phase").set("gameover");
-      }
-    }).catch((error) => console.error("Could not update separated player state.", error));
+  return resolveGameOutcome(room, now) || changed;
+}
+
+function checkSeparation() {
+  const room = state.room;
+  if (!room || room.phase !== "playing") return;
+  if (state.localMode) {
+    updateSeparationState(room, Date.now());
+    renderGame(room);
+    return;
   }
+  if (!state.roomRef || room.navigatorId !== state.player.id) return;
+  state.roomRef.transaction((current) => {
+    if (!current || current.phase !== "playing" || current.navigatorId !== state.player.id) return;
+    if (!updateSeparationState(current, Date.now())) return;
+    return current;
+  }).catch((error) => console.error("Could not update separated player state.", error));
 }
 
 function startSeparationMonitor() {
@@ -961,37 +1163,19 @@ function stopSeparationMonitor() {
 function maybeCompleteRoom() {
   const room = state.room;
   if (!room || room.phase !== "playing") return;
-  const survivors = livingPlayers(room.players);
-  if (!survivors.length) {
-    state.roomRef.child("phase").set("gameover");
-    state.roomRef.child("finishedAt").set(Date.now());
+  const explorers = livingPlayers(room.players).filter((player) => player.id !== room.navigatorId);
+  if (explorers.length && !(room.objectivePhase === 2 && explorers.every((player) => player.escaped === true))) return;
+  if (state.localMode) {
+    resolveGameOutcome(room);
+    renderGame(room);
     return;
   }
-  if (samePosition(room.groupPosition, room.maze.exit)) {
-    state.roomRef.transaction((current) => {
-      if (!current || current.phase !== "playing" || !samePosition(current.groupPosition, current.maze.exit)) return;
-      current.phase = "escaped";
-      current.finishedAt = Date.now();
-      return current;
-    });
-  }
-}
-
-async function sendDirection(direction) {
-  if (!state.roomRef || state.room?.navigatorId !== state.player.id ||
-      !["up", "down", "left", "right", "stop", "wait"].includes(direction)) return;
-  try {
-    await state.roomRef.child("directions").push({
-      senderId: state.player.id,
-      senderName: state.player.name,
-      direction,
-      timestamp: Date.now()
-    });
-    setNotice(direction === "stop" || direction === "wait" ? `GROUP: ${direction.toUpperCase()}` : `GROUP: GO ${direction.toUpperCase()}`, "success");
-  } catch (error) {
-    console.error("Could not send direction.", error);
-    setNotice("Direction could not be delivered.", "error");
-  }
+  state.roomRef?.transaction((current) => {
+    if (!current || current.phase !== "playing") return;
+    resolveGameOutcome(current);
+    if (current.phase === "playing") return;
+    return current;
+  }).catch((error) => console.error("Could not resolve the room outcome.", error));
 }
 
 async function sendChat(event) {
@@ -1039,38 +1223,61 @@ function updateChat(messages) {
 
 function handleKeys(event) {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
+  if (event.target instanceof HTMLElement && event.target.isContentEditable) return;
   const keyToDirection = {
     ArrowUp: "up", w: "up", W: "up", ArrowRight: "right", d: "right", D: "right",
     ArrowDown: "down", s: "down", S: "down", ArrowLeft: "left", a: "left", A: "left"
   };
   const direction = keyToDirection[event.key];
-  if (!direction || state.room?.navigatorId !== state.player?.id ||
-      state.room.players?.[state.player.id]?.alive === false) return;
+  const me = state.room?.players?.[state.player?.id];
+  if (!direction || state.room?.navigatorId === state.player?.id ||
+      me?.alive === false || me?.escaped === true) return;
   event.preventDefault();
-  moveGroup(direction);
+  movePlayer(direction);
 }
 
 function startLocalDemo() {
+  if (state.presenceRef) {
+    state.presenceRef.remove().catch((error) => console.error("Could not release remote presence before local play.", error));
+  }
+  state.roomRef?.off();
+  state.roomRef?.child("messages").off();
+  state.roomRef?.child("directions").off();
+  state.roomRef = null;
+  state.presenceRef = null;
+  state.joined = false;
+  localStorage.removeItem(ROOM_STORAGE_KEY);
   const maze = makeMaze();
+  const navigatorPosition = chooseNavigatorPosition(maze);
+  const route = buildMonsterRoute(maze);
+  const routeIndex = chooseMonsterRouteIndex(maze, route, navigatorPosition);
   state.localMode = true;
   state.roomCode = "DEMO";
   state.room = {
     phase: "playing",
     gameId: "local-demo",
-    navigatorId: state.player.id,
+    objectivePhase: 1,
+    navigatorId: "demo-navigator",
     startedAt: Date.now(),
-    groupPosition: { ...maze.start },
-    moveCount: 0,
-    monsterPressure: 0,
-    monster: { position: initialMonsterPosition(maze), stepCount: 0, lastMovedAt: Date.now() },
+    navigatorFoundAt: null,
+    monster: {
+      position: { ...route[routeIndex] },
+      route,
+      routeIndex,
+      stepCount: 0,
+      moveInterval: MONSTER_MOVE_MS,
+      lastMovedAt: Date.now()
+    },
     maze,
     players: {
-      [state.player.id]: { ...state.player, connected: true, alive: true, escaped: false, position: { ...maze.start } },
-      demo: { id: "demo", name: "Player Two", color: PLAYER_COLORS[1], connected: true, alive: true, escaped: false, position: { ...maze.start } }
+      [state.player.id]: { ...state.player, connected: true, alive: true, escaped: false, joinedAt: 1, position: { ...maze.start } },
+      "demo-navigator": { id: "demo-navigator", name: "The Navigator", color: PLAYER_COLORS[1], connected: true, alive: true, escaped: false, joinedAt: 2, position: navigatorPosition }
     },
     messages: {}
   };
   renderGame(state.room);
+  startMonsterMovement();
+  startSeparationMonitor();
 }
 
 function bootstrap() {

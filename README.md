@@ -1,16 +1,23 @@
 # The Maze of Many
 
-A realtime, cooperative survival maze for 2–8 players. It is a static HTML/CSS/JavaScript site for GitHub Pages and uses Firebase Realtime Database. Players enter a name, create or join a four-character room, and then move as one party through a shared generated maze.
+A realtime cooperative survival maze for 2–8 players, built as a static HTML/CSS/JavaScript site for GitHub Pages with Firebase Realtime Database.
 
 ## Play
 
-1. Enable **Realtime Database** for the Firebase project in `script.js` and configure rules that permit the demo reads and writes.
-2. Publish this repository with GitHub Pages, or run `python3 -m http.server 8000` from the repository root and open <http://localhost:8000>.
-3. Enter a name, create a room, then share its code. Other players enter that code to join the same lobby.
-4. Once at least two people are present, the host starts the run. A random player becomes Navigator and controls the entire party with arrow keys, WASD, or on-screen controls.
-5. The Navigator sees the whole map and the moving Monster. Explorers see only nearby cells. Stay together, avoid the Monster, and reach the exit.
+1. Enable **Realtime Database** for the Firebase project configured in `script.js` and set rules that permit the demo's reads, writes, transactions, and disconnect handlers.
+2. Publish with GitHub Pages, or run `python3 -m http.server 8000` from the repository root and open <http://localhost:8000>.
+3. Enter a name, create a room, and share its four-character code. Other players enter that code to join.
+4. The room host starts the run once at least two players are connected. One player is assigned as the stationary Navigator; the other players are Explorers.
 
-Rooms are stored independently at `rooms/{ROOM_CODE}`. Player ID, name, and last room are saved in localStorage so refreshes can reconnect to the same player and room. A player who is separated by more than two maze steps gets a warning and has 15 seconds to regroup before being lost.
+## Game rules
+
+- **Phase 01 — Find the Navigator:** Explorers move independently with WASD, arrow keys, or the on-screen directional pad. Their view is limited by fog, and the Navigator's marker only appears nearby. The Navigator cannot move and sees the whole maze.
+- **Phase 02 — Find the Exit:** Reaching the Navigator reveals the exit objective. Explorers must physically find the exit; the Navigator guides them through live chat but cannot move anyone.
+- A deterministic patrol route is generated and stored in the room for each maze. The Monster follows valid corridors at a steady pace. Staying within one corridor of it for long enough is fatal; use side passages and keep moving.
+- Explorer separation is measured by maze paths, not straight-line distance. The most isolated Explorer gets a warning and 25 seconds to regroup before being lost.
+- All living Explorers must reach the exit to complete the run. The Navigator is stationary and does not need to reach it.
+
+Rooms are isolated at `rooms/{ROOM_CODE}`. Player identity, name, and last room are saved in localStorage so a refresh can reconnect. The client uses Firebase Realtime Database listeners and transactions to synchronize player positions, roles, objective phase, the shared Monster patrol, chat, and outcomes.
 
 ## Firebase notes
 
