@@ -1461,7 +1461,8 @@ body {
   to { opacity: 0.64; transform: scale(0.97); }
 }
 
-.game-screen.danger-near::before {
+.game-screen.danger-near::before,
+.game-screen.in-territory::before {
   content: "";
   position: fixed;
   z-index: 2;
@@ -1470,6 +1471,16 @@ body {
   border: 1px solid rgba(131,45,45,0.18);
   box-shadow: inset 0 0 100px rgba(110,19,28,0.13);
   animation: danger-breathe 2.4s ease-in-out infinite alternate;
+}
+
+.game-screen.in-territory::before {
+  border-color: rgba(131,45,45,0.13);
+  box-shadow: inset 0 0 110px rgba(95,22,28,0.12);
+  animation-duration: 3.4s;
+}
+
+.game-screen.danger-critical::before {
+  animation-duration: 0.7s;
 }
 
 @keyframes danger-breathe {
@@ -1677,6 +1688,33 @@ body {
   background: rgba(181,93,82,0.055);
 }
 
+.territory-cell {
+  z-index: 1;
+  background-color: rgba(105,34,39,0.12);
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(184,72,72,0.075) 0,
+    rgba(184,72,72,0.075) 1px,
+    transparent 1px,
+    transparent 5px
+  );
+  box-shadow: inset 0 0 9px rgba(145,39,45,0.12);
+}
+
+.territory-cell::after {
+  position: absolute;
+  z-index: 1;
+  inset: 2px;
+  border: 1px dashed rgba(169,76,76,0.22);
+  content: "";
+  pointer-events: none;
+}
+
+.territory-cell .player-marker,
+.territory-cell .monster-marker {
+  z-index: 3;
+}
+
 .player-cell {
   background: rgba(155,203,208,0.08);
 }
@@ -1690,6 +1728,12 @@ body {
   width: 9px;
   height: 1px;
   background: #a47a72;
+}
+
+.legend-territory {
+  border: 1px dashed rgba(188,94,91,0.8);
+  border-radius: 1px !important;
+  background: rgba(136,49,53,0.28);
 }
 
 .separation-status {

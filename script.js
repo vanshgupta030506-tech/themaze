@@ -47,6 +47,7 @@ const state = {
   lastGameId: null,
   lastObjectivePhase: null,
   navigatorSignal: false,
+  wasInTerritory: false,
   monsterDangerStage: 0,
   notice: null,
   lastMessageAt: 0,
@@ -193,6 +194,28 @@ function makeMaze(size = MAZE_SIZE) {
     stack.push({ x, y });
   }
 
+  const extraPassages = [];
+  for (const cell of cells.flat()) {
+    for (const direction of [
+      { dx: 1, dy: 0, wall: "east", opposite: "west" },
+      { dx: 0, dy: 1, wall: "south", opposite: "north" }
+    ]) {
+      const x = cell.x + direction.dx;
+      const y = cell.y + direction.dy;
+      if (x < size && y < size && cell.walls[direction.wall]) {
+        extraPassages.push({ cell, x, y, ...direction });
+      }
+    }
+  }
+  for (let index = extraPassages.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(Math.random() * (index + 1));
+    [extraPassages[index], extraPassages[swap]] = [extraPassages[swap], extraPassages[index]];
+  }
+  for (const passage of extraPassages.slice(0, Math.round(size * size * 0.12))) {
+    passage.cell.walls[passage.wall] = false;
+    cells[passage.y][passage.x].walls[passage.opposite] = false;
+  }
+
   const distances = new Map([["0,0", 0]]);
   const queue = [{ x: 0, y: 0 }];
   let exit = { x: 0, y: 0 };
@@ -255,24 +278,145 @@ function graphDistances(maze, origin) {
   return distances;
 }
 
+function graphDistancesFromMany(maze, origins) {
+  const distances = new Map();
+  const queue = [];
+  for (const origin of origins) {
+    if (!validPosition(origin, maze)) continue;
+    const key = positionKey(origin);
+    if (distances.has(key)) continue;
+    distances.set(key, 0);
+    queue.push(origin);
+  }
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index];
+    const distance = distances.get(positionKey(current));
+    for (const direction of Object.keys(DIRECTIONS)) {
+      const next = getStep(current, direction, maze);
+      if (!next || distances.has(positionKey(next))) continue;
+      distances.set(positionKey(next), distance + 1);
+      queue.push(next);
+    }
+  }
+  return distances;
+}
+
 function playerDistance(room, first, second) {
   if (!normalizeMaze(room?.maze) || !validPosition(first, room.maze) || !validPosition(second, room.maze)) return Infinity;
   return graphDistances(room.maze, first).get(`${second.x},${second.y}`) ?? Infinity;
 }
 
-function buildMonsterRoute(maze) {
-  const route = [{ ...maze.start }];
-  const visited = new Set([`${maze.start.x},${maze.start.y}`]);
+function positionKey(position) {
+  return position ? `${position.x},${position.y}` : "";
+}
+
+function mazePath(maze, start, goal, blocked = new Set()) {
+  if (!validPosition(start, maze) || !validPosition(goal, maze) || blocked.has(positionKey(start)) ||
+      blocked.has(positionKey(goal))) return null;
+  const startKey = positionKey(start);
+  const parents = new Map([[startKey, null]]);
+  const queue = [start];
+  for (let index = 0; index < queue.length; index += 1) {
+    const position = queue[index];
+    const key = positionKey(position);
+    if (samePosition(position, goal)) {
+      const path = [];
+      let currentKey = key;
+      while (currentKey) {
+        const [x, y] = currentKey.split(",").map(Number);
+        path.push({ x, y });
+        currentKey = parents.get(currentKey);
+      }
+      return path.reverse();
+    }
+    for (const direction of Object.keys(DIRECTIONS)) {
+      const next = getStep(position, direction, maze);
+      if (!next || blocked.has(positionKey(next)) || parents.has(positionKey(next))) continue;
+      parents.set(positionKey(next), key);
+      queue.push(next);
+    }
+  }
+  return null;
+}
+
+function shuffled(values) {
+  const result = [...values];
+  for (let index = result.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(Math.random() * (index + 1));
+    [result[index], result[swap]] = [result[swap], result[index]];
+  }
+  return result;
+}
+
+function connectedTerritory(maze, avoidPositions = []) {
+  const fromStart = graphDistances(maze, maze.start);
+  const fromExit = graphDistances(maze, maze.exit);
+  const eligible = new Set(maze.cells.flat()
+    .filter((cell) => (fromStart.get(positionKey(cell)) ?? 0) >= MONSTER_DANGER_RADIUS + 2 &&
+      (fromExit.get(positionKey(cell)) ?? 0) >= MONSTER_DANGER_RADIUS + 2 &&
+      !avoidPositions.some((position) => samePosition(cell, position)))
+    .map(positionKey));
+  const targetSize = Math.round(maze.width * maze.height * 0.23);
+  const territoryDistance = (territory) => graphDistancesFromMany(maze, territory);
+  const seeds = shuffled([...eligible]);
+
+  for (const seed of seeds) {
+    const territory = new Set([seed]);
+    let frontier = [seed];
+    while (territory.size < targetSize && frontier.length) {
+      const currentKey = frontier[Math.floor(Math.random() * frontier.length)];
+      frontier = frontier.filter((key) => key !== currentKey);
+      const [x, y] = currentKey.split(",").map(Number);
+      const neighbors = shuffled(Object.keys(DIRECTIONS)
+        .map((direction) => getStep({ x, y }, direction, maze))
+        .filter((position) => position && eligible.has(positionKey(position)) && !territory.has(positionKey(position)))
+        .map(positionKey));
+      for (const neighbor of neighbors) {
+        if (territory.has(neighbor)) continue;
+        territory.add(neighbor);
+        frontier.push(neighbor);
+        if (territory.size >= targetSize) break;
+      }
+    }
+    if (territory.size < Math.floor(maze.width * maze.height * 0.2)) continue;
+    if (!mazePath(maze, maze.start, maze.exit, territory)) continue;
+    const cells = [...territory].map((key) => {
+      const [x, y] = key.split(",").map(Number);
+      return { x, y };
+    });
+    const distanceFromTerritory = territoryDistance(cells);
+    const avoidDistances = avoidPositions.length ? graphDistancesFromMany(maze, avoidPositions) : null;
+    if (avoidDistances && cells.some((cell) =>
+      (avoidDistances.get(positionKey(cell)) ?? Infinity) <= MONSTER_DANGER_RADIUS + 1
+    )) continue;
+    const navigatorOptions = maze.cells.flat().filter((cell) =>
+      !territory.has(positionKey(cell)) && !samePosition(cell, maze.start) && !samePosition(cell, maze.exit) &&
+      (fromStart.get(positionKey(cell)) ?? 0) >= 8 &&
+      (distanceFromTerritory.get(positionKey(cell)) ?? Infinity) > MONSTER_DANGER_RADIUS + 1
+    );
+    if (navigatorOptions.length) return cells;
+  }
+  throw new Error("Could not generate a safe, connected Monster territory. Try starting a new maze.");
+}
+
+function buildMonsterRoute(maze, territory) {
+  if (!Array.isArray(territory) || territory.length < 2) {
+    throw new Error("The Monster needs a connected territory with at least two cells.");
+  }
+  const territoryKeys = new Set(territory.map(positionKey));
+  const routeStart = territory[Math.floor(Math.random() * territory.length)];
+  const route = [{ ...routeStart }];
+  const visited = new Set([positionKey(routeStart)]);
   const walk = (position) => {
     const options = Object.keys(DIRECTIONS)
       .map((direction) => getStep(position, direction, maze))
-      .filter((next) => next && !visited.has(`${next.x},${next.y}`));
+      .filter((next) => next && territoryKeys.has(positionKey(next)) && !visited.has(positionKey(next)));
     for (let index = options.length - 1; index > 0; index -= 1) {
       const swap = Math.floor(Math.random() * (index + 1));
       [options[index], options[swap]] = [options[swap], options[index]];
     }
     for (const next of options) {
-      const key = `${next.x},${next.y}`;
+      const key = positionKey(next);
       if (visited.has(key)) continue;
       visited.add(key);
       route.push({ ...next });
@@ -280,45 +424,79 @@ function buildMonsterRoute(maze) {
       route.push({ ...position });
     }
   };
-  walk(maze.start);
+  walk(routeStart);
+  if (visited.size !== territoryKeys.size) {
+    throw new Error("The generated Monster territory is not connected.");
+  }
   return route;
 }
 
-function chooseNavigatorPosition(maze) {
+function chooseNavigatorPosition(maze, territory, monsterPosition) {
   const fromStart = graphDistances(maze, maze.start);
-  const candidates = maze.cells.flat().filter((cell) =>
+  const fromMonster = graphDistances(maze, monsterPosition);
+  const territoryDistances = graphDistancesFromMany(maze, territory);
+  const candidates = shuffled(maze.cells.flat().filter((cell) =>
     !samePosition(cell, maze.start) && !samePosition(cell, maze.exit) &&
-    (fromStart.get(`${cell.x},${cell.y}`) ?? 0) >= 8
-  );
-  const farthest = Math.max(...candidates.map((cell) => fromStart.get(`${cell.x},${cell.y}`) || 0));
-  const remote = candidates.filter((cell) => (fromStart.get(`${cell.x},${cell.y}`) || 0) >= farthest - 3);
-  const position = remote[Math.floor(Math.random() * remote.length)] || maze.exit;
+    (territoryDistances.get(positionKey(cell)) ?? Infinity) > MONSTER_DANGER_RADIUS + 1 &&
+    (fromStart.get(positionKey(cell)) ?? 0) >= 8 &&
+    (fromMonster.get(positionKey(cell)) ?? Infinity) > MONSTER_DANGER_RADIUS + 1
+  ));
+  if (!candidates.length) throw new Error("Could not find a safe Navigator spawn.");
+  const farthest = Math.max(...candidates.map((cell) => fromStart.get(positionKey(cell)) || 0));
+  const remote = candidates.filter((cell) => (fromStart.get(positionKey(cell)) || 0) >= farthest - 3);
+  const position = remote[Math.floor(Math.random() * remote.length)];
   return { x: position.x, y: position.y };
 }
 
-function chooseMonsterRouteIndex(maze, route, navigatorPosition) {
+function chooseMonsterRouteIndex(maze, route) {
   const fromStart = graphDistances(maze, maze.start);
-  const fromNavigator = graphDistances(maze, navigatorPosition);
   const candidates = route.map((position, routeIndex) => ({
     routeIndex,
-    score: Math.min(
-      fromStart.get(`${position.x},${position.y}`) ?? 0,
-      fromNavigator.get(`${position.x},${position.y}`) ?? 0
-    )
+    score: fromStart.get(positionKey(position)) ?? 0
   })).filter(({ routeIndex, score }) =>
     routeIndex < route.length - 1 && score > MONSTER_DANGER_RADIUS + 1
   );
-  if (!candidates.length) return Math.min(1, route.length - 1);
+  if (!candidates.length) throw new Error("Could not find a safe starting cell for the Monster.");
   const bestScore = Math.max(...candidates.map((candidate) => candidate.score));
   const safest = candidates.filter((candidate) => candidate.score >= bestScore - 2);
   return safest[Math.floor(Math.random() * safest.length)].routeIndex;
 }
 
+function createMonsterSetup(maze, navigatorPosition = null) {
+  const territory = connectedTerritory(maze, navigatorPosition ? [navigatorPosition] : []);
+  const route = buildMonsterRoute(maze, territory);
+  const routeIndex = chooseMonsterRouteIndex(maze, route);
+  const monsterPosition = route[routeIndex];
+  const navigator = navigatorPosition || chooseNavigatorPosition(maze, territory, monsterPosition);
+  if (territory.some((cell) => samePosition(cell, navigator)) ||
+      playerDistance({ maze }, navigator, monsterPosition) <= MONSTER_DANGER_RADIUS + 1) {
+    throw new Error("The generated Navigator spawn is not safely separated from the Monster.");
+  }
+  return {
+    territory,
+    route,
+    routeIndex,
+    monsterPosition: { ...monsterPosition },
+    navigatorPosition: { ...navigator }
+  };
+}
+
 function advanceMonster(room, now = Date.now()) {
   const monster = room.monster;
-  if (!Array.isArray(monster?.route) || monster.route.length < 2) return;
-  monster.routeIndex = ((Number(monster.routeIndex) || 0) + 1) % monster.route.length;
-  monster.position = { ...monster.route[monster.routeIndex] };
+  if (!Array.isArray(monster?.route) || monster.route.length < 3 ||
+      !Array.isArray(monster.territory) || monster.territory.length < 2) return;
+  const currentIndex = Number(monster.routeIndex) || 0;
+  const nextIndex = currentIndex >= monster.route.length - 1 ? 1 : currentIndex + 1;
+  const nextPosition = monster.route[nextIndex];
+  const territory = new Set(monster.territory.map(positionKey));
+  if (!validPosition(nextPosition, room.maze) || !territory.has(positionKey(nextPosition))) return;
+  const currentPosition = monster.position;
+  const connectedStep = Object.keys(DIRECTIONS).some((direction) =>
+    samePosition(getStep(currentPosition, direction, room.maze), nextPosition)
+  );
+  if (!connectedStep) return;
+  monster.routeIndex = nextIndex;
+  monster.position = { ...nextPosition };
   monster.stepCount = (Number(monster.stepCount) || 0) + 1;
   monster.lastMovedAt = now;
 }
@@ -326,19 +504,28 @@ function advanceMonster(room, now = Date.now()) {
 function initializeMonsterPatrol() {
   const room = state.room;
   if (state.patrolInitializing || !state.roomRef || !normalizeMaze(room?.maze) || !room.monster) return;
-  const route = buildMonsterRoute(room.maze);
-  const existingIndex = route.findIndex((position) => samePosition(position, room.monster.position));
-  const routeIndex = existingIndex >= 0
-    ? existingIndex
-    : chooseMonsterRouteIndex(room.maze, route, room.players?.[room.navigatorId]?.position || room.maze.start);
+  let setup;
+  try {
+    setup = createMonsterSetup(room.maze);
+  } catch (error) {
+    console.error("Could not prepare the Monster territory for this room.", error);
+    setNotice(error.message || "The Monster territory could not be created.", "error");
+    return;
+  }
   state.patrolInitializing = true;
   state.roomRef.transaction((current) => {
-    if (!current || current.phase !== "playing" || Array.isArray(current.monster?.route)) return;
+    if (!current || current.phase !== "playing" ||
+        (Array.isArray(current.monster?.territory) && current.monster.territory.length >= 2 &&
+          Array.isArray(current.monster?.route) && current.monster.route.length >= 3)) return;
+    const navigator = current.players?.[current.navigatorId];
+    if (!navigator) return;
+    navigator.position = { ...setup.navigatorPosition };
     current.monster = {
       ...current.monster,
-      position: { ...route[routeIndex] },
-      route,
-      routeIndex,
+      position: { ...setup.monsterPosition },
+      territory: setup.territory,
+      route: setup.route,
+      routeIndex: setup.routeIndex,
       moveInterval: MONSTER_MOVE_MS,
       lastMovedAt: Date.now()
     };
@@ -367,18 +554,19 @@ function attachRealtimeListeners() {
     reconcilePresence(state.room);
     reconcileNavigator(state.room);
     maybeFindNavigator(state.room);
-    if (state.room.phase === "lobby") renderLobby(state.room);
-    else if (state.room.phase === "countdown") renderCountdown(state.room);
-    else if (["playing", "gameover", "escaped"].includes(state.room.phase) && normalizeMaze(state.room.maze)) renderGame(state.room);
-    else renderLobby({ ...state.room, phase: "lobby" });
-    handleRoomEvents(state.room);
     if (state.room.gameId && state.room.gameId !== state.lastGameId) {
       state.lastGameId = state.room.gameId;
       state.watchingAfterDeath = false;
       state.lastObjectivePhase = null;
       state.navigatorSignal = false;
+      state.wasInTerritory = false;
       state.monsterDangerStage = 0;
     }
+    if (state.room.phase === "lobby") renderLobby(state.room);
+    else if (state.room.phase === "countdown") renderCountdown(state.room);
+    else if (["playing", "gameover", "escaped"].includes(state.room.phase) && normalizeMaze(state.room.maze)) renderGame(state.room);
+    else renderLobby({ ...state.room, phase: "lobby" });
+    handleRoomEvents(state.room);
     const localRecord = state.room.players?.[state.player.id];
     if (localRecord?.separatedAt && state.separationNoticeAt !== localRecord.separatedAt) {
       state.separationNoticeAt = localRecord.separatedAt;
@@ -484,6 +672,12 @@ function handleRoomEvents(room) {
     playerDistance(room, me.position, navigator.position) <= NAVIGATOR_SIGNAL_RANGE);
   if (signalDetected && !state.navigatorSignal) setNotice("SIGNAL DETECTED · THE NAVIGATOR IS CLOSE.", "success");
   state.navigatorSignal = signalDetected;
+  const territoryKeys = new Set((room.monster?.territory || []).map(positionKey));
+  const inTerritory = Boolean(room.phase === "playing" && me && me.id !== room.navigatorId &&
+    me.alive !== false && territoryKeys.has(positionKey(me.position)));
+  if (inTerritory && !state.wasInTerritory) setNotice("YOU HAVE ENTERED UNKNOWN TERRITORY.", "warning");
+  state.wasInTerritory = inTerritory;
+  document.body.classList.toggle("in-territory", inTerritory);
   updateDangerState();
 }
 
@@ -700,10 +894,15 @@ function startCountdown() {
   }
   if (!isLocalHost() || orderedPlayers(state.room?.players).length < 2) return;
   const maze = makeMaze();
+  let setup;
+  try {
+    setup = createMonsterSetup(maze);
+  } catch (error) {
+    console.error("Could not prepare a safe maze and Monster territory.", error);
+    setNotice(error.message || "Could not prepare a safe maze. Try again.", "error");
+    return;
+  }
   const now = Date.now();
-  const navigatorPosition = chooseNavigatorPosition(maze);
-  const monsterRoute = buildMonsterRoute(maze);
-  const monsterRouteIndex = chooseMonsterRouteIndex(maze, monsterRoute, navigatorPosition);
   state.roomRef.transaction((room) => {
     if (!room || !["lobby", "gameover", "escaped"].includes(room.phase)) return;
     const currentPlayers = orderedPlayers(room.players || {});
@@ -716,7 +915,7 @@ function startCountdown() {
         ...player,
         alive: true,
         escaped: false,
-        position: isNavigator ? { ...navigatorPosition } : { ...maze.start },
+        position: isNavigator ? { ...setup.navigatorPosition } : { ...maze.start },
         separatedAt: null,
         monsterDangerSince: null
       };
@@ -728,9 +927,10 @@ function startCountdown() {
     room.navigatorFoundAt = null;
     room.navigatorFoundBy = null;
     room.monster = {
-      position: { ...monsterRoute[monsterRouteIndex] },
-      route: monsterRoute,
-      routeIndex: monsterRouteIndex,
+      position: { ...setup.monsterPosition },
+      territory: setup.territory,
+      route: setup.route,
+      routeIndex: setup.routeIndex,
       stepCount: 0,
       moveInterval: MONSTER_MOVE_MS,
       lastMovedAt: now
@@ -827,6 +1027,7 @@ function renderMaze(room, isNavigator) {
   const patrolCells = new Set(isNavigator
     ? (room.monster?.route || []).map((cell) => `${cell.x},${cell.y}`)
     : []);
+  const territoryCells = new Set((room.monster?.territory || []).map(positionKey));
   const monsterPosition = room.monster?.position;
   for (let y = bounds.minY; y <= bounds.maxY; y += 1) {
     for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
@@ -834,6 +1035,7 @@ function renderMaze(room, isNavigator) {
       const visible = isCellVisible(room, x, y, isNavigator);
       const danger = isNavigator && (dangerDistances.get(`${x},${y}`) ?? Infinity) <= MONSTER_DANGER_RADIUS;
       const atMonster = samePosition(monsterPosition, { x, y });
+      const territoryVisible = territoryCells.has(`${x},${y}`) && (isNavigator || visible);
       const exitVisible = visible && (isNavigator || room.objectivePhase === 2) && samePosition(maze.exit, { x, y });
       const revealNavigator = canSeeNavigator(room, isNavigator);
       const hasPlayer = livingPlayers(room.players).some((player) =>
@@ -842,7 +1044,7 @@ function renderMaze(room, isNavigator) {
       const wallStyles = [
         ["north", "border-top"], ["east", "border-right"], ["south", "border-bottom"], ["west", "border-left"]
       ].map(([wall, property]) => `${property}:${cell.walls[wall] ? "2px solid var(--wall)" : "2px solid transparent"}`).join(";");
-      cells.push(`<div class="maze-cell ${visible ? "revealed" : "fogged"} ${danger ? "danger-cell" : ""} ${isNavigator && patrolCells.has(`${x},${y}`) ? "patrol-cell" : ""} ${visible && hasPlayer ? "player-cell" : ""} ${atMonster && isNavigator ? "monster-cell" : ""} ${exitVisible ? "exit-cell" : ""}" style="${wallStyles}" aria-label="${visible ? `Cell ${x + 1}, ${y + 1}${danger ? ", monster danger zone" : ""}` : "Unexplored"}">${visible ? markerForCell(room, x, y, isNavigator, revealNavigator) : ""}</div>`);
+      cells.push(`<div class="maze-cell ${visible ? "revealed" : "fogged"} ${danger ? "danger-cell" : ""} ${territoryVisible ? "territory-cell" : ""} ${isNavigator && patrolCells.has(`${x},${y}`) ? "patrol-cell" : ""} ${visible && hasPlayer ? "player-cell" : ""} ${atMonster && isNavigator ? "monster-cell" : ""} ${exitVisible ? "exit-cell" : ""}" style="${wallStyles}" aria-label="${visible ? `Cell ${x + 1}, ${y + 1}${territoryVisible ? ", Monster territory" : ""}${danger ? ", monster danger zone" : ""}` : "Unexplored"}">${visible ? markerForCell(room, x, y, isNavigator, revealNavigator) : ""}</div>`);
     }
   }
   return `<div class="maze-viewport" tabindex="0"><div class="maze-grid ${isNavigator ? "full-map" : "local-map"}" style="--columns:${bounds.maxX - bounds.minX + 1};--cell:27px">${cells.join("")}</div></div>`;
@@ -879,14 +1081,17 @@ function renderGame(room) {
   const escapedCount = explorers.filter((player) => player.alive !== false && player.escaped).length;
   const objectivePhase = room.objectivePhase === 2 ? 2 : 1;
   const near = room.phase === "playing" && monsterDistance(room, state.player.id) <= MONSTER_DANGER_RADIUS;
+  const territoryKeys = new Set((room.monster?.territory || []).map(positionKey));
+  const inTerritory = !isNavigator && territoryKeys.has(positionKey(me.position));
   document.body.classList.toggle("danger-near", near);
+  document.body.classList.toggle("in-territory", inTerritory);
   const objectiveLabel = objectivePhase === 1 ? "FIND THE NAVIGATOR" : "FIND THE EXIT";
   const myPosition = me.position || room.maze.start;
   const transitionVisible = room.navigatorFoundAt && Date.now() - room.navigatorFoundAt < 4500;
-  appRoot.innerHTML = `<section class="game-screen ${near ? "danger-near" : ""}">
+  appRoot.innerHTML = `<section class="game-screen ${near ? "danger-near" : ""} ${inTerritory ? "in-territory" : ""}">
     <header class="game-topbar"><div><span class="eyebrow"><span class="pulse-dot"></span> ${state.connected ? "SYNCHRONIZED" : "RECONNECTING"} · ROOM ${escapeHtml(state.roomCode)}</span><h1>THE MAZE <span>OF MANY</span></h1></div><div class="game-top-meta"><span>RUN <strong>${escapeHtml(String(room.gameId || "").slice(-5).toUpperCase())}</strong></span><button id="leave-room" class="text-btn">LEAVE</button></div></header>
     <section class="objective-banner phase-${objectivePhase}"><span>PHASE 0${objectivePhase}</span><strong>${objectiveLabel}</strong><p>${isNavigator ? "You see the whole maze. Stay where you are and guide the Explorers in chat." : objectivePhase === 1 ? "Explore on your own. Find the person who can see the whole maze." : "The Navigator has been found. Reach the exit together, one Explorer at a time."}</p></section>
-    <div class="game-layout ${isNavigator ? "navigator-layout" : "explorer-layout"}"><main class="map-column"><div class="map-heading"><div><span class="eyebrow">${isNavigator ? "NAVIGATOR · FULL TACTICAL VIEW" : "EXPLORER · FIELD VIEW"}</span><p>${isNavigator ? "You are stationary. Track every Explorer, the patrol, and the exit." : objectivePhase === 1 ? "Find the hidden Navigator. The maze beyond your sight is unknown." : "Follow the Navigator's guidance through the maze."}</p></div><span class="map-coordinates">${String(myPosition.x + 1).padStart(2, "0")} / ${String(myPosition.y + 1).padStart(2, "0")}</span></div>${renderMaze(room, isNavigator)}<div class="map-legend"><span><i class="legend-you" style="--player-color:${safeColor(state.player.color)}"></i> ${isNavigator ? "NAVIGATOR" : "YOU"}</span>${isNavigator ? `<span><i class="legend-monster"></i> MONSTER · PATROL ${room.monster?.route?.length || 0} CELLS</span><span><i class="legend-exit"></i> EXIT</span><span class="patrol-legend">PATROL ROUTE</span>` : `<span class="fog-legend">UNEXPLORED</span><span class="party-hint">${objectivePhase === 1 ? "NAVIGATOR HIDDEN" : "EXIT REVEALED AS YOU EXPLORE"}</span>`}</div></main><aside class="control-column"><div class="role-card"><span class="eyebrow">Your role</span><strong>${isNavigator ? "THE NAVIGATOR · STATIONARY" : "AN EXPLORER · YOU CONTROL YOURSELF"}</strong><span>${escapeHtml(isNavigator ? "They can see what you cannot. Guide them through chat; you cannot move." : objectivePhase === 1 ? "Move independently with WASD, arrows, or the directional pad." : "You must reach the exit yourself. The Navigator cannot move you.")}</span></div>${renderPlayerPanel(room, isNavigator)}${renderChat(room)}</aside></div>
+    <div class="game-layout ${isNavigator ? "navigator-layout" : "explorer-layout"}"><main class="map-column"><div class="map-heading"><div><span class="eyebrow">${isNavigator ? "NAVIGATOR · FULL TACTICAL VIEW" : "EXPLORER · FIELD VIEW"}</span><p>${isNavigator ? "You are stationary. Track every Explorer, the patrol, and the exit." : objectivePhase === 1 ? "Find the hidden Navigator. The maze beyond your sight is unknown." : "Follow the Navigator's guidance through the maze."}</p></div><span class="map-coordinates">${String(myPosition.x + 1).padStart(2, "0")} / ${String(myPosition.y + 1).padStart(2, "0")}</span></div>${renderMaze(room, isNavigator)}<div class="map-legend"><span><i class="legend-you" style="--player-color:${safeColor(state.player.color)}"></i> ${isNavigator ? "NAVIGATOR" : "YOU"}</span>${isNavigator ? `<span><i class="legend-monster"></i> MONSTER</span><span><i class="legend-territory"></i> TERRITORY · ${Math.round((room.monster?.territory?.length || 0) / (room.maze.width * room.maze.height) * 100)}%</span><span><i class="legend-exit"></i> EXIT</span><span class="patrol-legend">PATROL · ${room.monster?.route?.length || 0} STEPS</span>` : `<span class="fog-legend">UNEXPLORED</span><span class="party-hint">${inTerritory ? "UNKNOWN TERRITORY" : objectivePhase === 1 ? "NAVIGATOR HIDDEN" : "EXIT REVEALED AS YOU EXPLORE"}</span>`}</div></main><aside class="control-column"><div class="role-card"><span class="eyebrow">Your role</span><strong>${isNavigator ? "THE NAVIGATOR · STATIONARY" : "AN EXPLORER · YOU CONTROL YOURSELF"}</strong><span>${escapeHtml(isNavigator ? "They can see what you cannot. Guide them through chat; you cannot move." : objectivePhase === 1 ? "Move independently with WASD, arrows, or the directional pad." : "You must reach the exit yourself. The Navigator cannot move you.")}</span></div>${renderPlayerPanel(room, isNavigator)}${renderChat(room)}</aside></div>
     ${transitionVisible ? `<div class="phase-transition"><span>NAVIGATOR FOUND</span><strong>PHASE 02 · FIND THE EXIT</strong></div>` : ""}
     ${!alive && room.phase === "playing" && !state.watchingAfterDeath ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">Signal lost</span><h2>YOU WERE<br /><span>LOST.</span></h2><p>You can still watch the survivors find their way.</p><button id="watch-game" class="primary-btn">Watch the group <span>↗</span></button></div></div>` : ""}
     ${room.phase === "gameover" ? `<div class="completion-overlay"><div class="completion-card"><span class="eyebrow">No Explorers remain</span><h2>THE MAZE<br /><span>WON.</span></h2><p>Nobody found the way out.</p><button id="retry-game" class="primary-btn">${isLocalHost() ? "Try again" : "Waiting for the host"} <span>↗</span></button></div></div>` : ""}
@@ -921,7 +1126,8 @@ function monsterDistance(room, playerId = state.player?.id) {
 
 function updateDangerState() {
   if (!state.room || state.room.phase !== "playing") {
-    document.body.classList.remove("danger-near", "danger-critical");
+    document.body.classList.remove("danger-near", "danger-critical", "in-territory");
+    state.wasInTerritory = false;
     state.monsterDangerStage = 0;
     return;
   }
@@ -1063,7 +1269,8 @@ function startMonsterMovement() {
       stopMonsterMovement();
       return;
     }
-    if (!Array.isArray(state.room.monster?.route) || state.room.monster.route.length < 2) {
+    if (!Array.isArray(state.room.monster?.territory) || state.room.monster.territory.length < 2 ||
+        !Array.isArray(state.room.monster?.route) || state.room.monster.route.length < 3) {
       initializeMonsterPatrol();
       return;
     }
@@ -1248,9 +1455,7 @@ function startLocalDemo() {
   state.joined = false;
   localStorage.removeItem(ROOM_STORAGE_KEY);
   const maze = makeMaze();
-  const navigatorPosition = chooseNavigatorPosition(maze);
-  const route = buildMonsterRoute(maze);
-  const routeIndex = chooseMonsterRouteIndex(maze, route, navigatorPosition);
+  const setup = createMonsterSetup(maze);
   state.localMode = true;
   state.roomCode = "DEMO";
   state.room = {
@@ -1261,9 +1466,10 @@ function startLocalDemo() {
     startedAt: Date.now(),
     navigatorFoundAt: null,
     monster: {
-      position: { ...route[routeIndex] },
-      route,
-      routeIndex,
+      position: { ...setup.monsterPosition },
+      territory: setup.territory,
+      route: setup.route,
+      routeIndex: setup.routeIndex,
       stepCount: 0,
       moveInterval: MONSTER_MOVE_MS,
       lastMovedAt: Date.now()
@@ -1271,7 +1477,7 @@ function startLocalDemo() {
     maze,
     players: {
       [state.player.id]: { ...state.player, connected: true, alive: true, escaped: false, joinedAt: 1, position: { ...maze.start } },
-      "demo-navigator": { id: "demo-navigator", name: "The Navigator", color: PLAYER_COLORS[1], connected: true, alive: true, escaped: false, joinedAt: 2, position: navigatorPosition }
+      "demo-navigator": { id: "demo-navigator", name: "The Navigator", color: PLAYER_COLORS[1], connected: true, alive: true, escaped: false, joinedAt: 2, position: setup.navigatorPosition }
     },
     messages: {}
   };
