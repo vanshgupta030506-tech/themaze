@@ -1351,3 +1351,281 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+.onboarding-card h2,
+.lobby-card h2 {
+  margin: 25px 0 10px;
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.04em;
+}
+
+.lobby-input {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  padding: 12px;
+  border: 1px solid rgba(255,255,255,0.14);
+  outline: 0;
+  background: #090c10;
+  color: #e8e8df;
+  font: 15px "SF Pro Display", "Segoe UI", sans-serif;
+}
+
+.lobby-input:focus {
+  border-color: rgba(155,203,208,0.6);
+}
+
+.lobby-input::placeholder {
+  color: #566064;
+}
+
+.room-code-input {
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3em;
+}
+
+.onboarding-card .primary-btn,
+.lobby-card > .primary-btn {
+  margin-top: 17px;
+}
+
+.secondary-btn {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-color: rgba(255,255,255,0.14);
+  color: #d5d9d3;
+}
+
+.form-divider {
+  margin: 26px 0 18px;
+  color: #737d7e;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+}
+
+.form-error {
+  padding: 10px;
+  border-left: 2px solid #ad6767;
+  background: rgba(130,48,48,0.12);
+  color: #e1a6a2;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.copy-code {
+  border: 1px solid rgba(255,255,255,0.12);
+  font-size: 9px;
+}
+
+.copy-code:hover {
+  color: #c2dcd4;
+}
+
+.lobby-card #leave-room {
+  display: block;
+  margin: 12px auto 0;
+}
+
+.countdown-screen {
+  min-height: calc(100vh - 100px);
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 20px;
+  background: radial-gradient(circle, rgba(132,162,151,0.08), transparent 42%);
+  text-align: center;
+}
+
+.countdown-number {
+  color: #e8e8df;
+  font-size: clamp(100px, 23vw, 250px);
+  font-weight: 300;
+  line-height: 0.9;
+  letter-spacing: -0.1em;
+  text-shadow: 0 0 60px rgba(155,203,208,0.16);
+  animation: countdown-pulse 950ms ease-in-out infinite alternate;
+}
+
+.countdown-screen p {
+  color: #8e9997;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+}
+
+@keyframes countdown-pulse {
+  to { opacity: 0.64; transform: scale(0.97); }
+}
+
+.game-screen.danger-near::before {
+  content: "";
+  position: fixed;
+  z-index: 2;
+  pointer-events: none;
+  inset: 0;
+  border: 1px solid rgba(131,45,45,0.18);
+  box-shadow: inset 0 0 100px rgba(110,19,28,0.13);
+  animation: danger-breathe 2.4s ease-in-out infinite alternate;
+}
+
+@keyframes danger-breathe {
+  to { box-shadow: inset 0 0 150px rgba(126,22,31,0.22); }
+}
+
+.party-cell {
+  background: rgba(153,190,178,0.12);
+  box-shadow: inset 0 0 20px rgba(153,190,178,0.1);
+}
+
+.party-formation {
+  position: absolute;
+  z-index: 5;
+  inset: 50% auto auto 50%;
+  width: 0;
+  height: 0;
+}
+
+.party-member {
+  position: absolute;
+  top: var(--party-y);
+  left: var(--party-x);
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(5,8,9,0.92);
+  border-radius: 50%;
+  background: var(--player-color);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--player-color), transparent 38%);
+  color: #101516;
+  font: 7px "SFMono-Regular", Consolas, monospace;
+}
+
+.party-self {
+  z-index: 2;
+  outline: 1px solid #f0ede4;
+}
+
+.cell-player-names {
+  position: absolute;
+  top: calc(50% + 22px);
+  left: 50%;
+  z-index: 6;
+  width: max-content;
+  max-width: 155px;
+  transform: translateX(-50%);
+  color: #d8ded8;
+  font-size: 6px;
+  text-shadow: 0 1px 3px #000;
+  pointer-events: none;
+}
+
+.monster-cell {
+  background: rgba(120,34,42,0.18);
+}
+
+.danger-cell {
+  background: rgba(105,33,38,0.075);
+  box-shadow: inset 0 0 10px rgba(134,37,41,0.08);
+}
+
+.monster-cell.danger-cell {
+  background: rgba(120,34,42,0.2);
+}
+
+.monster-marker {
+  position: absolute;
+  z-index: 5;
+  width: 19px;
+  height: 19px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 4px;
+  border-radius: 48% 48% 42% 42%;
+  background: #070809;
+  box-shadow: 0 0 18px rgba(182,50,56,0.6), 0 0 0 6px rgba(143,36,42,0.1);
+  animation: monster-drift 1.8s ease-in-out infinite alternate;
+}
+
+.monster-marker i {
+  width: 3px;
+  height: 3px;
+  display: block;
+  border-radius: 50%;
+  background: #e78470;
+  box-shadow: 0 0 5px #ec584e;
+}
+
+@keyframes monster-drift {
+  to { transform: translateY(-2px) scale(1.05); }
+}
+
+.legend-monster {
+  background: #b74649;
+  box-shadow: 0 0 9px rgba(198,65,67,0.8);
+}
+
+.party-hint {
+  color: #879995;
+}
+
+.wait-controls {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.wait-controls button {
+  flex: 1;
+  min-height: 32px;
+  border: 1px solid rgba(255,255,255,0.11);
+  background: rgba(255,255,255,0.02);
+  color: #aeb9b4;
+  cursor: pointer;
+  font: 8px "SFMono-Regular", Consolas, monospace;
+  letter-spacing: 0.12em;
+}
+
+.player-dead {
+  opacity: 0.43;
+  filter: grayscale(0.8);
+}
+
+.player-dead .player-state {
+  color: #ca817c;
+}
+
+.movement-controls {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.07);
+}
+
+@media (max-width: 850px) {
+  .onboarding-card,
+  .lobby-layout .lobby-card {
+    width: 100%;
+  }
+}
+
+@media (max-width: 560px) {
+  .countdown-screen {
+    min-height: calc(100svh - 60px);
+  }
+
+  .party-member {
+    width: 19px;
+    height: 19px;
+    font-size: 6px;
+  }
+
+  .cell-player-names {
+    font-size: 5px;
+  }
+}
